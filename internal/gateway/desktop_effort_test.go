@@ -145,7 +145,7 @@ func TestClaudeDesktopEffortIDs(t *testing.T) {
 		t.Fatalf("Desktop list: %s", rec.Body)
 	}
 	for _, m := range list.Data {
-		if tier := DesktopTier(m.ID); tier == "" || desktopPicker(m.ID) != (tier != "haiku") {
+		if tier := DesktopTier(m.ID); tier == "" || !desktopPicker(m.ID) {
 			t.Errorf("tier %s: unexpected effort picker", m.ID)
 		}
 	}
@@ -186,7 +186,7 @@ func TestClaudeDesktopEffortReachesModel(t *testing.T) {
 	}
 	t.Cleanup(func() { StandIn = before })
 	alias := desktopEffortAlias + aliasNumber("fake/m1")
-	for _, model := range []string{alias, "mythos-magpie-opus", "mythos-magpie-sonnet", "mythos-magpie-fable", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"} {
+	for _, model := range []string{alias, "mythos-magpie-opus", "mythos-magpie-sonnet", "mythos-magpie-haiku", "mythos-magpie-fable", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"} {
 		for _, c := range []struct{ asked, sent string }{
 			{"low", "low"}, {"high", "high"}, {"max", "high"}, {"xhigh", "high"},
 		} {

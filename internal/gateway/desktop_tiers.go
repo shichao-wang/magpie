@@ -18,6 +18,9 @@ var DesktopTiers func() map[string]string
 // explicit anthropic_family_tier identifies the tier independently of the alias.
 // Desktop shows the name, not the id, and folds rows of one name into one entry;
 // tier suffixes keep the four choices distinct when they route to the same model.
+// Haiku uses a Mythos alias only when its routed model has effort levels. Desktop
+// recognizes manual thinking only on standard ids, which also overwrite names;
+// keep the custom name for budget-only models and adapt their requests instead.
 func desktopModels() []map[string]any {
 	tiers := []struct{ id, name, tier string }{
 		{"mythos-magpie-opus", "Claude Opus", "opus"},
@@ -49,14 +52,27 @@ func desktopModels() []map[string]any {
 				loadedServed = true
 			}
 			name := routed
+			found := false
 			for _, model := range entries {
 				if model.ID == routed {
+					found = true
 					name = desktopName(model)
 					e.Context, e.Output = model.Context, model.Output
+					if tier.tier == "haiku" {
+						e.Efforts = desktopHaikuEfforts(model)
+					}
 					break
 				}
 			}
+			if !found && tier.tier == "haiku" {
+				if p, model, ok := provider.Resolve(routed); ok {
+					e.Efforts = desktopHaikuEfforts(provider.Entry{Provider: p, Model: model, Efforts: p.Efforts(model)})
+				}
+			}
 			e.Name = name + " · " + strings.TrimPrefix(tier.name, "Claude ")
+		}
+		if tier.tier == "haiku" && len(e.Efforts) > 0 {
+			e.ID, e.Model = "mythos-magpie-haiku", "mythos-magpie-haiku"
 		}
 		if tier.tier != "haiku" {
 			e.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
@@ -82,7 +98,7 @@ func DesktopTier(id string) string {
 		return "opus"
 	case "mythos-magpie-sonnet":
 		return "sonnet"
-	case "claude-haiku-magpie":
+	case "claude-haiku-magpie", "mythos-magpie-haiku":
 		return "haiku"
 	case "mythos-magpie-fable":
 		return "fable"
@@ -97,7 +113,7 @@ func DesktopTier(id string) string {
 func desktopFixedTier(id string) bool {
 	id = strings.TrimSuffix(strings.ToLower(id), "[1m]")
 	switch id {
-	case "opus", "sonnet", "haiku", "fable", "mythos-magpie-opus", "mythos-magpie-sonnet", "claude-haiku-magpie", "mythos-magpie-fable", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5":
+	case "opus", "sonnet", "haiku", "fable", "mythos-magpie-opus", "mythos-magpie-sonnet", "claude-haiku-magpie", "mythos-magpie-haiku", "mythos-magpie-fable", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5":
 		return true
 	}
 	return false

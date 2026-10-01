@@ -488,7 +488,11 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for i, c := range counts {
-		res, err := s.forward(r.Context(), c.p, provider.Anthropic, "/v1/messages/count_tokens", rewriteModel(body, model), r.Header)
+		countBody := body
+		if agentOf(r) == "claude-desktop" && DesktopTier(modelOf(body)) == "haiku" {
+			countBody = desktopHaikuThinking(body, c.p, model)
+		}
+		res, err := s.forward(r.Context(), c.p, provider.Anthropic, "/v1/messages/count_tokens", rewriteModel(countBody, model), r.Header)
 		if err != nil {
 			if r.Context().Err() == nil {
 				s.restAfter(c, http.StatusBadGateway, nil, []byte(err.Error()))
@@ -1084,6 +1088,9 @@ func sinceStart(before, d time.Duration) int64 {
 // attempt sends a request to one provider. call.To stays empty when the
 // provider has no endpoint to send it to.
 func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.Protocol, p provider.Provider, model string, body []byte, call *Call) (int, string) {
+	if from == provider.Anthropic && call.Agent == "claude-desktop" && DesktopTier(modelOf(body)) == "haiku" {
+		body = desktopHaikuThinking(body, p, model)
+	}
 	// A Claude Code subscription must run through the genuine binary. Direct
 	// OAuth HTTP requests are content-classified as third-party traffic when
 	// they carry another agent's harness (Pi, OpenCode, and others).
@@ -1249,6 +1256,7 @@ func claudeCodeHeader(k string) bool {
 // written, when the provider serves the model on another of its endpoints
 // but not this one.
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.Provider, proto provider.Protocol, model string, body []byte, u *Usage) (status int, msg string, done bool) {
+	haiku := DesktopTier(modelOf(body)) == "haiku"
 	body = rewriteModel(body, model)
 	switch proto {
 	case provider.Chat:
@@ -1281,7 +1289,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		body = withBodyEffort(proto, body, e)
 	}
 	if proto == provider.Anthropic && agentOf(r) == "claude-desktop" {
-		body = desktopThinking(body, model)
+		if haiku {
+			body = desktopHaikuThinking(body, p, model)
+		} else {
+			body = desktopThinking(body, model)
+		}
 	}
 	path := pathOf(proto)
 	if proto == provider.Anthropic && p.Account == nil && fromClaudeCode(r.Header) && r.URL.Query().Get("beta") == "true" {
