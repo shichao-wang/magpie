@@ -389,7 +389,7 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	data := []map[string]any{}
 	shown := catalogFor(r)
 	if agentOf(r) == "claude-desktop" {
-		data = desktopModels(shown)
+		data = desktopModels()
 	} else {
 		for _, e := range shown {
 			data = append(data, modelObject(e))
@@ -404,6 +404,14 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 	id := unprefixed(r.PathValue("id"))
+	if agentOf(r) == "claude-desktop" && desktopTierOf(id) != "" {
+		for _, model := range desktopModels() {
+			if desktopTierOf(model["id"].(string)) == desktopTierOf(id) {
+				writeJSON(w, 200, model)
+				return
+			}
+		}
+	}
 	for _, e := range provider.Catalog() {
 		if e.ID == id {
 			writeJSON(w, 200, modelObject(e))
@@ -449,6 +457,9 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, provider.Anthropic, 400, err.Error())
 		return
+	}
+	if agentOf(r) == "claude-desktop" {
+		model = desktopTurn(unprefixed(model), body)
 	}
 	// Count the same masked prompt that generation sends to the vendor.
 	w, body, unmask := redacted(w, body)

@@ -10,10 +10,9 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
-// desktopPicker is Claude Desktop's tIt (index.chunk-D3OyLXgG.js, 2.7032):
-// whether the model id it was given gets a thinking-effort picker. IC is
-// qS of the lowercased id; HFt's keys that have effort levels, and UFt.
-func desktopPicker(id string) bool {
+// desktopCatalogKey is Desktop's tC/zC normalization (2.9939.2): both
+// catalog names and built-in effort capabilities use this key.
+func desktopCatalogKey(id string) string {
 	e := strings.ToLower(id)
 	t := regexp.MustCompile(`^arn:aws[a-z-]*:bedrock:[^/]+/`).ReplaceAllString(e, "")
 	t = regexp.MustCompile(`^(?:[a-z][a-z0-9-]*\.)?anthropic\.`).ReplaceAllString(t, "")
@@ -23,12 +22,51 @@ func desktopPicker(id string) bool {
 		t = regexp.MustCompile(`-v\d+(?::\d+)?$`).ReplaceAllString(t, "")
 	}
 	t = regexp.MustCompile(`@\d{8}$`).ReplaceAllString(t, "")
-	t = regexp.MustCompile(`-\d{8}$`).ReplaceAllString(t, "")
+	return regexp.MustCompile(`-\d{8}$`).ReplaceAllString(t, "")
+}
+
+// desktopPicker follows lVt's table and fallback for models with effort levels.
+func desktopPicker(id string) bool {
+	t := desktopCatalogKey(id)
 	switch t {
 	case "claude-sonnet-4-6", "claude-sonnet-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5":
 		return true
 	}
 	return regexp.MustCompile(`^(?:claude-)?(?:fable|mythos)(?:-|$)`).MatchString(t)
+}
+
+// Desktop's selector gives a matching catalog or hybrid name precedence over
+// discovery's display_name (pVt/cUt, 2.9939.2). Tier aliases must not normalize
+// to standard model ids, including when the client adds [1m].
+func TestClaudeDesktopTierCatalogNames(t *testing.T) {
+	setup(t, provider.Anthropic, &fake{})
+	catalog := map[string]string{
+		"claude-opus-5": "Opus 5", "claude-sonnet-5": "Sonnet 5",
+		"claude-haiku-4-5": "Haiku 4.5", "claude-fable-5": "Fable 5",
+	}
+	pickerName := func(id, name string) string {
+		if override := catalog[desktopCatalogKey(id)]; override != "" {
+			return override
+		}
+		return name
+	}
+	if pickerName("magpie.anthropic.claude-opus-5", "My model") != "Opus 5" {
+		t.Fatal("standard model no longer reproduces the catalog name override")
+	}
+	for _, m := range desktopModels() {
+		id, name := m["id"].(string), m["display_name"].(string)
+		if m["anthropic_family_tier"] != desktopTierOf(id) {
+			t.Errorf("%s: wrong family tier %v", id, m["anthropic_family_tier"])
+		}
+		for _, asked := range []string{id, id + "[1m]"} {
+			if got := pickerName(asked, name); got != name {
+				t.Errorf("%s: catalog replaced %q with %q", asked, name, got)
+			}
+			if desktopPicker(asked) != (desktopTierOf(id) != "haiku") {
+				t.Errorf("%s: effort capabilities changed", asked)
+			}
+		}
+	}
 }
 
 // Desktop's small_fast pick (_$n): an id with haiku, sonnet or opus in it
@@ -103,18 +141,19 @@ func TestClaudeDesktopEffortIDs(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
-	got := map[string]string{}
+	if len(list.Data) != 4 {
+		t.Fatalf("Desktop list: %s", rec.Body)
+	}
 	for _, m := range list.Data {
-		got[strings.TrimSuffix(m.Description, " in magpie")] = m.ID
+		if tier := desktopTierOf(m.ID); tier == "" || desktopPicker(m.ID) != (tier != "haiku") {
+			t.Errorf("tier %s: unexpected effort picker", m.ID)
+		}
 	}
 	for id, want := range map[string]string{
 		"fake/m1":              desktopEffortAlias + aliasNumber("fake/m1"),
 		"fake/claude-opus-4-8": "magpie-" + aliasNumber("fake/claude-opus-4-8") + ".anthropic.claude-opus-4-8",
 		"fake/m2":              aliasFor("fake/m2"),
 	} {
-		if got[id] != want {
-			t.Errorf("%s listed as %q, want %q (%s)", id, got[id], want, rec.Body)
-		}
 		for _, asked := range []string{want, want + "[1m]"} {
 			if real, ok := aliased(asked); !ok || real != id {
 				t.Errorf("aliased(%s) = %q %v", asked, real, ok)
@@ -138,30 +177,40 @@ func TestClaudeDesktopEffortReachesModel(t *testing.T) {
 	if err := provider.SetModelEfforts("fake/m1", []string{"low", "high"}); err != nil {
 		t.Fatal(err)
 	}
+	before := StandIn
+	StandIn = func(agent, model string) string {
+		if agent == "claude-desktop" && desktopTierOf(model) != "" {
+			return "fake/m1"
+		}
+		return ""
+	}
+	t.Cleanup(func() { StandIn = before })
 	alias := desktopEffortAlias + aliasNumber("fake/m1")
-	for _, c := range []struct{ asked, sent string }{
-		{"low", "low"}, {"high", "high"}, {"max", "high"}, {"xhigh", "high"},
-	} {
-		body := `{"model":"` + alias + `","max_tokens":32000,"stream":true,"thinking":{"type":"adaptive"},"output_config":{"effort":"` + c.asked + `"},` +
-			`"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}`
-		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
-		req.Header.Set("x-api-key", Token+"-claude-desktop")
-		rec := httptest.NewRecorder()
-		New().Handler().ServeHTTP(rec, req)
-		if rec.Code != 200 {
-			t.Fatalf("%s: %d %s", c.asked, rec.Code, rec.Body)
-		}
-		var sent struct {
-			Model        string `json:"model"`
-			OutputConfig struct {
-				Effort string `json:"effort"`
-			} `json:"output_config"`
-		}
-		if err := json.Unmarshal(f.got, &sent); err != nil {
-			t.Fatal(err)
-		}
-		if sent.Model != "m1" || sent.OutputConfig.Effort != c.sent {
-			t.Errorf("%s: sent %s at %q, want m1 at %q", c.asked, sent.Model, sent.OutputConfig.Effort, c.sent)
+	for _, model := range []string{alias, "mythos-magpie-opus", "mythos-magpie-sonnet", "mythos-magpie-fable", "claude-opus-5", "claude-sonnet-5", "claude-fable-5"} {
+		for _, c := range []struct{ asked, sent string }{
+			{"low", "low"}, {"high", "high"}, {"max", "high"}, {"xhigh", "high"},
+		} {
+			body := `{"model":"` + model + `","max_tokens":32000,"stream":true,"thinking":{"type":"adaptive"},"output_config":{"effort":"` + c.asked + `"},` +
+				`"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}`
+			req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+			req.Header.Set("x-api-key", Token+"-claude-desktop")
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, req)
+			if rec.Code != 200 {
+				t.Fatalf("%s: %d %s", c.asked, rec.Code, rec.Body)
+			}
+			var sent struct {
+				Model        string `json:"model"`
+				OutputConfig struct {
+					Effort string `json:"effort"`
+				} `json:"output_config"`
+			}
+			if err := json.Unmarshal(f.got, &sent); err != nil {
+				t.Fatal(err)
+			}
+			if sent.Model != "m1" || sent.OutputConfig.Effort != c.sent {
+				t.Errorf("%s: sent %s at %q, want m1 at %q", c.asked, sent.Model, sent.OutputConfig.Effort, c.sent)
+			}
 		}
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,6 +37,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // desktopProfileID is magpie's profile in Desktop's configLibrary: a
@@ -113,6 +115,58 @@ func claudeDesktop(home string) *Agent {
 			also = filepath.Join(d, "Claude")
 		}
 	}
+	fields := []Field{{
+		Key: "provider", Label: "provider",
+		Get: func() string {
+			if desktopWired(p) {
+				return magpieID
+			}
+			return ""
+		},
+		Set: func(v string) error {
+			if v == "" {
+				return desktopOff(p)
+			}
+			return desktopOn(p)
+		},
+		Options: func(map[string]string) []Option {
+			return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
+				Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
+		},
+	}}
+	for _, tier := range claudeTiers {
+		fields = append(fields, Field{
+			Key: tier, Label: tier, Quiet: true,
+			Get: func() string {
+				if !desktopWired(p) {
+					return ""
+				}
+				v, _ := edit.GetJSON(desktopTiersPath(), tier)
+				return v
+			},
+			Set: func(v string) error {
+				if !desktopWired(p) {
+					if v == "" {
+						return nil
+					}
+					return fmt.Errorf("connect Claude Desktop to magpie first; %s can then have its own model", tier)
+				}
+				if v != "" && !isMagpie(v) {
+					return fmt.Errorf("%s: %q is not a model magpie serves", tier, v)
+				}
+				if v == "" {
+					return edit.DelJSON(desktopTiersPath(), tier)
+				}
+				return edit.SetJSON(desktopTiersPath(), edit.KV{Path: tier, Value: v})
+			},
+			Options: func(map[string]string) []Option {
+				if !desktopWired(p) {
+					return nil
+				}
+				return viaMagpie("claude-desktop", "")
+			},
+		})
+	}
 	return &Agent{
 		ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Aliases: []string{"claude-app"},
 		Dir: p.dir, Path: p.config,
@@ -129,7 +183,7 @@ func claudeDesktop(home string) *Agent {
 		},
 		Notice: func() string {
 			if desktopWired(p) {
-				return "Claude Desktop reads this at start-up — quit and reopen it to run on magpie (Code and Cowork, no Anthropic sign-in)."
+				return "Claude Desktop reads its gateway at start-up — quit and reopen it if you changed the provider (Code and Cowork, no Anthropic sign-in); tier changes take effect immediately."
 			}
 			return "Claude Desktop reads this at start-up — quit and reopen it to sign in with Anthropic again."
 		},
@@ -146,26 +200,19 @@ func claudeDesktop(home string) *Agent {
 			return wiringOff("Claude Desktop", p.prof, func(k string) (string, bool) { return edit.GetJSON(p.prof, k) },
 				"inferenceGatewayBaseUrl", gateway.URL(), "inferenceGatewayApiKey", gateway.TokenFor("claude-desktop"))
 		},
-		Fields: []Field{{
-			Key: "provider", Label: "provider",
-			Get: func() string {
-				if desktopWired(p) {
-					return magpieID
-				}
-				return ""
-			},
-			Set: func(v string) error {
-				if v == "" {
-					return desktopOff(p)
-				}
-				return desktopOn(p)
-			},
-			Options: func(map[string]string) []Option {
-				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
-					Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
-			},
-		}},
+		Fields: fields,
 	}
+}
+
+// Desktop has no native tier settings. Keep magpie's choices beside its own
+// settings, not as keys Desktop might rewrite in the gateway profile.
+func desktopTiersPath() string { return filepath.Join(settings.Dir(), "claude-desktop-tiers.json") }
+
+func desktopClearTiers() error {
+	if err := os.Remove(desktopTiersPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // desktopWired: _meta.json lists magpie's profile.
@@ -325,7 +372,7 @@ func desktopOff(p desktopPaths) error {
 		made = strings.Split(m, "\n")
 	}
 	if !stashed && !slices.ContainsFunc(entries, desktopOurs) {
-		return nil
+		return desktopClearTiers()
 	}
 
 	for f, was := range map[string]string{p.config: mode, p.config3p: mode3p} {
@@ -393,7 +440,7 @@ func desktopOff(p desktopPaths) error {
 			os.Remove(f)
 		}
 	}
-	return nil
+	return desktopClearTiers()
 }
 
 func desktopEmpty(b []byte) bool {

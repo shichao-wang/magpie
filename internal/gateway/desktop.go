@@ -135,28 +135,58 @@ func claudeLooking(e provider.Entry) string {
 	return aliasFor(e.ID)
 }
 
-// desktopModels is /v1/models as Claude Desktop is shown it: every model by
-// an id it keeps (claudeLooking), named so the picker tells them apart —
-// it shows the name, not the id, and folds rows of one name into one entry.
-func desktopModels(entries []provider.Entry) []map[string]any {
-	names := map[string]int{}
-	for _, e := range entries {
-		names[desktopName(e)]++
+// desktopModels lists four stable routing aliases. Standard Claude ids have their
+// display names replaced by Desktop's model catalog, even with display_name set.
+// Mythos aliases keep its effort picker without matching a catalog model; the
+// explicit anthropic_family_tier identifies the tier independently of the alias.
+func desktopModels() []map[string]any {
+	tiers := []struct{ id, name, tier string }{
+		{"mythos-magpie-opus", "Claude Opus", "opus"},
+		{"mythos-magpie-sonnet", "Claude Sonnet", "sonnet"},
+		{"claude-haiku-magpie", "Claude Haiku", "haiku"},
+		{"mythos-magpie-fable", "Claude Fable", "fable"},
 	}
-	data := make([]map[string]any, 0, len(entries))
-	for _, e := range entries {
-		m := modelObject(e)
-		name := desktopName(e)
-		if names[name] > 1 && name != e.ID {
-			name += " (" + e.ID + ")"
+	data := make([]map[string]any, 0, len(tiers))
+	served := provider.Served()
+	for _, tier := range tiers {
+		e := provider.Entry{ID: tier.id, Model: tier.id, Name: tier.name}
+		routed := desktopDefault(tier.id)
+		if routed != "" {
+			name := routed
+			for _, model := range served {
+				if model.ID == routed {
+					name = desktopName(model)
+					break
+				}
+			}
+			e.Name = name + " · " + strings.TrimPrefix(tier.name, "Claude ")
 		}
-		m["display_name"] = name
-		if m["id"] = claudeLooking(e); m["id"] != e.ID {
-			m["description"] = e.ID + " in magpie"
+		if tier.tier != "haiku" {
+			e.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
+		}
+		m := modelObject(e)
+		m["owned_by"], m["anthropic_family_tier"] = "anthropic", tier.tier
+		if routed != "" {
+			m["description"] = routed + " in magpie"
 		}
 		data = append(data, m)
 	}
 	return data
+}
+
+func desktopTierOf(id string) string {
+	id = strings.ToLower(strings.TrimSuffix(id, "[1m]"))
+	switch id {
+	case "opus", "claude-opus-5", "mythos-magpie-opus":
+		return "opus"
+	case "sonnet", "claude-sonnet-5", "mythos-magpie-sonnet":
+		return "sonnet"
+	case "haiku", "claude-haiku-4-5", "claude-haiku-magpie":
+		return "haiku"
+	case "fable", "claude-fable-5", "mythos-magpie-fable":
+		return "fable"
+	}
+	return ""
 }
 
 func desktopName(e provider.Entry) string {
@@ -201,23 +231,8 @@ func isClaudeDesktop(r *http.Request) bool {
 	return strings.HasPrefix(ua, "Mozilla/") && strings.Contains(ua, " Claude/")
 }
 
-// Claude Desktop sends some requests on a model of its own choosing rather
-// than the one its session is on. A session's title (and branch name) is
-// asked for by one tool-less request whose model is its "small_fast" pick
-// from the gateway's list — the first id with haiku in it, else sonnet,
-// else opus (_$n in its app.asar, 2.7032), the session's model only when
-// none has one — so {"model":"claude-sonnet-5-thinking","max_tokens":200,
-// "system":"You write short session titles. …"} went to a Claude model the
-// user never picked. Claude Code in its Code tab asks for its own
-// claude-haiku-… by name for small tasks too.
-//
-// A session's turns carry tools; the model the latest one is for is the one
-// the user picked. A small tool-less request (a title's max_tokens is 200,
-// a turn's tens of thousands) for a model whose id reads as Claude's, and
-// any request for a model magpie doesn't serve, goes to that model instead,
-// so a chat the user started on a Claude model of their own stays on it. It is
-// kept on disk, so a title asked for before the first turn after a restart
-// goes there too; before any turn at all it goes to desktopDefault.
+// Desktop's four tier ids always use their own configuration. The last full
+// turn is kept only as a fallback for older sessions' auxiliary model ids.
 var desktopPicked struct {
 	sync.Mutex
 	model string
@@ -225,6 +240,30 @@ var desktopPicked struct {
 }
 
 func desktopPickedPath() string { return filepath.Join(settings.Dir(), "claude-desktop.model") }
+
+func desktopStandIn(model string) string {
+	if StandIn == nil {
+		return ""
+	}
+	model = strings.ToLower(strings.TrimSuffix(model, "[1m]"))
+	if tier := desktopTierOf(model); tier != "" {
+		model = tier
+	}
+	if m := StandIn("claude-desktop", model); m != "" && m != model {
+		return m
+	}
+	return ""
+}
+
+func desktopSessionModel(picked string) string {
+	if desktopTierOf(picked) != "" {
+		if m := desktopStandIn(picked); m != "" {
+			return m
+		}
+		return desktopDefault(picked)
+	}
+	return picked
+}
 
 // desktopTurn is the model a Claude Desktop request for asked is served by.
 func desktopTurn(asked string, body []byte) string {
@@ -239,12 +278,32 @@ func desktopTurn(asked string, body []byte) string {
 		desktopPicked.model, desktopPicked.from = strings.TrimSpace(string(b)), path
 	}
 	picked := desktopPicked.model
+	if desktopTierOf(asked) != "" {
+		if tools {
+			desktopPicked.model = asked
+			if os.MkdirAll(settings.Dir(), 0o755) == nil {
+				os.WriteFile(desktopPickedPath(), []byte(asked+"\n"), 0o600)
+			}
+		}
+		if m := desktopStandIn(asked); m != "" {
+			return m
+		}
+		if m := desktopDefault(asked); m != "" {
+			return m
+		}
+		return asked
+	}
 	if asked == picked {
 		return asked
 	}
 	if unserved(asked) || !tools && small(body) && desktopAccepts(asked) {
+		if m := desktopStandIn(asked); m != "" {
+			return m
+		}
 		if picked != "" {
-			return picked
+			if m := desktopSessionModel(picked); m != "" {
+				return m
+			}
 		}
 		if m := desktopDefault(asked); m != "" {
 			return m
@@ -260,19 +319,11 @@ func desktopTurn(asked string, body []byte) string {
 	return asked
 }
 
-// desktopDefault is the model a request Desktop sends before any turn has
-// named one goes to: a new session's first message is titled before it is
-// sent (ARNO), so nothing is picked yet when the title is asked for. It is
-// the model the agent is set to stand in for asked if there is one, else
-// the model a new Desktop session starts on — the first row of /v1/models
-// (resolveDefaultSessionModel in its app.asar takes the first model it
-// doesn't restrict), which is magpie's first model shown to it. "" when
-// that is asked itself or magpie shows Desktop no model.
+// desktopDefault uses a configured stand-in, else the first model in Desktop's
+// available provider catalog. It returns empty when no different model exists.
 func desktopDefault(asked string) string {
-	if StandIn != nil {
-		if m := StandIn("claude-desktop", asked); m != "" && m != asked {
-			return m
-		}
+	if m := desktopStandIn(asked); m != "" {
+		return m
 	}
 	shown, _ := provider.CatalogFor("claude-desktop")
 	if len(shown) == 0 || shown[0].ID == asked {

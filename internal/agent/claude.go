@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -278,20 +279,38 @@ var claudeManaged = func() string {
 	return "/etc/claude-code/managed-settings.json"
 }
 
-// StandIn is the model Claude Code is set to use in place of one it named
-// that magpie doesn't serve: claude-haiku-4-5-… for a title or a small
-// task goes to its haiku tier's model, and a name of no tier to its main
-// model. "" when Claude Code isn't routed through magpie or asked for
-// isn't Claude Code. For gateway.StandIn.
+// StandIn resolves a Claude Code model its tier names but magpie doesn't
+// serve, or a Claude Desktop session or auxiliary request with a configured tier.
+// Unset Desktop tiers fall back to the available catalog at the gateway.
 func StandIn(agent, model string) string {
-	if agent != "claude" {
+	if agent != "claude" && agent != "claude-desktop" {
 		return ""
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
+	if agent == "claude-desktop" {
+		return desktopStandIn(home, model)
+	}
 	return claudeStandIn(filepath.Join(home, ".claude", "settings.json"), model)
+}
+
+var desktopTierName = regexp.MustCompile(`^(?:claude-(?:\d+(?:[-.]\d+)*-)?)?(opus|sonnet|haiku|fable)(?:[-.]|$)`)
+
+func desktopStandIn(home, model string) string {
+	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	if !desktopWired(p) {
+		return ""
+	}
+	name := strings.ToLower(model[strings.LastIndex(model, "/")+1:])
+	if tier := desktopTierName.FindStringSubmatch(name); tier != nil {
+		v, _ := edit.GetJSON(desktopTiersPath(), tier[1])
+		if isMagpie(v) {
+			return v
+		}
+	}
+	return ""
 }
 
 func claudeStandIn(path, model string) string {

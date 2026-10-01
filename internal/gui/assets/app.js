@@ -832,16 +832,16 @@ function openAgentMenu(anchor, a, inFold) {
   items[0]?.focus({ preventScroll: true });
 }
 
-// Claude Code's opus/sonnet/haiku/fable can each have a model of their own
-// once it runs through magpie. They share one button, which lists the four;
+// Claude Code and Claude Desktop's opus/sonnet/haiku/fable can each have a
+// model of their own once they run through magpie. One button lists the four;
 // picking one opens the model picker for it.
 const TIERS = ["opus", "sonnet", "haiku", "fable"];
-// fields that fall back to the agent's model when unset
+// fields that follow a main model or Desktop's first catalog model when unset
 const FOLLOWS_MODEL = [...TIERS, "subagents"];
 
 // A field that follows the model unless set — Codex's subagents, Claude
-// Code's tiers — is a small square after the pickers rather than a third
-// picker, which a row has no room for: it wrapped onto a line of its own.
+// Code's tiers, Desktop's session tiers — is a small square after the
+// pickers rather than a third picker, which a row has no room for.
 // So is Codex's sign-in, ChatGPT or magpie as its provider.
 const extra = (f) => f.key === "tiers" || FOLLOWS_MODEL.includes(f.label) || f.label === "sign-in";
 const EXTRA_GLYPH = {
@@ -883,15 +883,16 @@ function tierMenu(a) {
   const tiers = a.fields.filter((f) => TIERS.includes(f.label));
   if (!tiers.length || !tiers.some((f) => f.options.length)) return null;
   const main = a.fields.find((f) => f.key === "model");
-  const mainName = optionFor(main, main.value)?.label || main.value;
+  const mainName = main && (optionFor(main, main.value)?.label || main.value);
+  const follows = main ? t("same as model ({model})", { model: mainName }) : t("unconfigured tier uses first catalog model");
   const custom = tiers.filter((f) => f.value);
   const name = (f) => optionFor(f, f.value)?.label || f.value;
   return {
     key: "tiers", label: "tiers", value: "", menu: true, custom: custom.length > 0,
-    summary: custom.length ? custom.map((f) => f.label).join(", ") : t("same as model"),
+    summary: custom.length ? custom.map((f) => f.label).join(", ") : t(main ? "same as model" : "unconfigured tier uses first catalog model"),
     options: tiers.map((f) => ({
-      value: f.key, label: f.label, icon: optionFor(f, f.value)?.icon || optionFor(main, main.value)?.icon,
-      note: f.value ? name(f) : t("same as model ({model})", { model: mainName }),
+      value: f.key, label: f.label, icon: optionFor(f, f.value)?.icon || (main && optionFor(main, main.value)?.icon) || a.icon,
+      note: f.value ? name(f) : follows,
     })),
   };
 }
@@ -1129,7 +1130,9 @@ function openPicker(agent, field, anchor, ev, only) {
   // the agent's own default: magpie's wiring comes out and the key is removed
   if (FOLLOWS_MODEL.includes(field.label)) {
     const main = agent.fields.find((f) => f.key === "model");
-    options.unshift({ value: "", label: t("Same as model"), note: optionFor(main, main.value)?.label || main.value, icon: optionFor(main, main.value)?.icon, reset: true });
+    const opt = main && optionFor(main, main.value);
+    options.unshift({ value: "", label: t(main ? "Same as model" : "unconfigured tier uses first catalog model"),
+      note: main ? opt?.label || main.value : t("first available catalog model"), icon: opt?.icon || agent.icon, reset: true });
   } else if (!only && !field.menu && !field.onPick && !options.some((o) => o.value === "")) options.unshift({ value: "", label: t("Default"), note: t("what {agent} ships with", { agent: agent.name }), icon: agent.icon, reset: true });
   const modelPicker = ["model", "small", "large", ...FOLLOWS_MODEL].includes(field.label) && !only;
   pick = { agent, field, options, anchor, cursor: 0, free: !only && !field.menu, modelPicker, effortPicker, groupFilter: "all" };

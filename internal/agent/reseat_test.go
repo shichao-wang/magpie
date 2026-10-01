@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -114,6 +115,36 @@ func TestReseatDelete(t *testing.T) {
 	// nothing else serves it: Claude Code as installed
 	if got := c.Field("model").Get(); got != "" {
 		t.Fatalf("claude: %q", got)
+	}
+}
+
+func TestReseatClaudeDesktopTiers(t *testing.T) {
+	home := reseatHome(t)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	os.MkdirAll(p.dir, 0o755)
+	a := mustFind(t, "claude-desktop")
+	mustApply(t, a, "provider", "magpie")
+	mustApply(t, a, "opus", "cop/claude-sonnet-4.5")
+	mustApply(t, a, "haiku", "cop/only-here")
+	mustApply(t, a, "sonnet", "ds/gpt-5")
+
+	moves, err := Reseat(func() error { return provider.SetOff("cop", true) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for tier, want := range map[string]string{"opus": "ds/claude-sonnet-4-5-20250929", "haiku": "", "sonnet": "ds/gpt-5"} {
+		if got := a.Field(tier).Get(); got != want {
+			t.Errorf("%s: %q, want %q", tier, got, want)
+		}
+	}
+	got := map[string]Move{}
+	for _, m := range moves {
+		got[m.Agent+" "+m.Field] = m
+	}
+	if got["Claude Desktop opus"].To != "ds/claude-sonnet-4-5-20250929" || got["Claude Desktop haiku"].To != "" {
+		t.Fatalf("Desktop tiers weren't reseated: %+v", moves)
 	}
 }
 

@@ -67,7 +67,7 @@ and there is a terminal version (`magpie tui`) and a plain CLI.
 | Agent        | File                              | Fields          |
 | ------------ | --------------------------------- | --------------- |
 | Claude Code  | `~/.claude/settings.json`         | provider, model, opus/sonnet/haiku/fable (through magpie) |
-| Claude Desktop | `Claude/` + `Claude-3p/configLibrary/` in `~/Library/Application Support` (`%LOCALAPPDATA%` on Windows, `~/.config` on Linux) | provider (its third-party gateway mode: Code and Cowork on magpie, no Anthropic sign-in; restart Desktop) |
+| Claude Desktop | `Claude/` + `Claude-3p/configLibrary/` in `~/Library/Application Support` (`%LOCALAPPDATA%` on Windows, `~/.config` on Linux); tiers in magpie's config dir | provider, opus/sonnet/haiku/fable (Desktop shows four options named for the routed models, with a tier suffix (e.g. GPT-6.1 Sol · Opus); each session tier routes through its configured model. Unconfigured tiers use the first available catalog model). Restart Desktop after switching its provider; tier changes take effect at the gateway immediately. |
 | Codex        | `~/.codex/config.toml`            | provider, model, effort |
 | Gemini CLI   | `~/.gemini/settings.json`, `~/.gemini/.env` | auth, model |
 | OpenCode     | `~/.config/opencode/opencode.json(c)` | model, small |
@@ -378,6 +378,9 @@ magpie codex deepseek/deepseek-chat   # any catalog model, through the gateway
 magpie claude moonshot/kimi-k2.5
 magpie claude haiku deepseek/deepseek-v4-flash   # one tier on its own model
 magpie claude haiku ""          # back to the main model
+magpie claude-desktop provider magpie      # connect Desktop; restart it to read the gateway
+magpie claude-desktop haiku deepseek/deepseek-v4-flash  # route Desktop's haiku sessions and auxiliary requests; no restart
+magpie claude-desktop haiku ""   # use the first available catalog model for haiku
 magpie gemini auth api-key
 magpie opencode anthropic/claude-sonnet-5
 magpie oc small anthropic/claude-haiku-4-5

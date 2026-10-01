@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // desktopSandbox is a home of its own with nothing of this machine's in
@@ -171,6 +172,84 @@ func TestClaudeDesktopFresh(t *testing.T) {
 	}
 	if after := desktopTree(t, p); !reflect.DeepEqual(after, before) {
 		t.Fatalf("second off: %v", after)
+	}
+}
+
+func TestClaudeDesktopTiers(t *testing.T) {
+	home, p := desktopSandbox(t)
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
+		t.Fatal(err)
+	}
+	a := claudeDesktop(home)
+	if err := a.Field("haiku").Set("deepseek/flash"); err == nil {
+		t.Fatal("a tier before Desktop is connected should fail")
+	}
+	if err := a.Field("haiku").Set(""); err != nil {
+		t.Fatalf("clearing an unconnected tier: %v", err)
+	}
+	if len(a.Field("haiku").Options(a.Values())) != 0 {
+		t.Fatal("an unconnected Desktop has no tier picker")
+	}
+	if err := a.Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(desktopTiersPath()); !os.IsNotExist(err) {
+		t.Fatalf("connecting alone wrote tiers: %v", err)
+	}
+	for _, tier := range claudeTiers {
+		if a.Field(tier).Get() != "" || len(a.Field(tier).Options(a.Values())) == 0 {
+			t.Fatalf("%s should follow Desktop, with models to choose from", tier)
+		}
+	}
+	if err := a.Field("haiku").Set("not-a-model"); err == nil {
+		t.Fatal("a tier accepted an unknown model")
+	}
+	if err := a.Field("haiku").Set("deepseek/flash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Field("opus").Set("deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	if prof := desktopJSON(t, p.prof); prof["haiku"] != nil || prof["opus"] != nil || prof["magpieTiers"] != nil {
+		t.Fatalf("tiers leaked into Desktop's profile: %v", prof)
+	}
+	if v := claudeDesktop(home).Field("haiku").Get(); v != "deepseek/flash" {
+		t.Fatalf("tier wasn't kept across agent instances: %q", v)
+	}
+	for _, model := range []string{"claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022", "haiku", "anthropic/claude-haiku-4-5"} {
+		if v := desktopStandIn(home, model); v != "deepseek/flash" {
+			t.Fatalf("%s stand-in: %q", model, v)
+		}
+	}
+	if v := StandIn("claude-desktop", "claude-opus-5"); v != "deepseek/pro" {
+		t.Fatalf("opus stand-in: %q", v)
+	}
+	if v := desktopStandIn(home, "claude-sonnet-5"); v != "" {
+		t.Fatalf("an unset tier took %q", v)
+	}
+	if v := desktopStandIn(home, "deepseek-opus-model"); v != "" {
+		t.Fatalf("a non-Claude model took %q", v)
+	}
+	if err := a.Field("haiku").Set(""); err != nil || a.Field("haiku").Get() != "" {
+		t.Fatalf("reset: %v, value %q", err, a.Field("haiku").Get())
+	}
+	if v := desktopStandIn(home, "claude-haiku-4-5"); v != "" {
+		t.Fatalf("a cleared tier took %q", v)
+	}
+	if err := a.Field("provider").Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(desktopTiersPath()); !os.IsNotExist(err) {
+		t.Fatalf("off left tiers: %v", err)
+	}
+	if _, err := os.Stat(p.prof); !os.IsNotExist(err) {
+		t.Fatalf("off left a Desktop profile: %v", err)
+	}
+	if v := desktopStandIn(home, "claude-opus-5"); v != "" {
+		t.Fatalf("off routed opus to %q", v)
+	}
+	if err := a.Field("provider").Set("magpie"); err != nil || a.Field("opus").Get() != "" {
+		t.Fatalf("reconnect revived a cleared tier: %v, value %q", err, a.Field("opus").Get())
 	}
 }
 

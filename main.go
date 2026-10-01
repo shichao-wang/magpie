@@ -114,8 +114,8 @@ func run(args []string) error {
 	// a provider added, edited or removed, or a list fetched anew, reaches
 	// the model lists agents keep in files of their own
 	catalog.Changed = agent.SyncCatalog
-	// a model Claude Code names that magpie doesn't serve goes to the one
-	// it is set to use for that tier
+	// Claude Code's unserved tier names and Claude Desktop's session and
+	// auxiliary tiers go to the model set for them
 	gateway.StandIn = agent.StandIn
 	// the setup kept the same on every computer, by whichever serves
 	gateway.WhileServing = append(gateway.WhileServing, davsync.Run)
