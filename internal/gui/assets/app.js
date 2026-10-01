@@ -881,7 +881,7 @@ const LAUNCH_GLYPH = "M2.5 3.5h11v9h-11zM5 6.5l2 1.75L5 10M8.5 10h2.5";
 
 function tierMenu(a) {
   const tiers = a.fields.filter((f) => TIERS.includes(f.label));
-  if (!tiers.length || !tiers.some((f) => f.options.length)) return null;
+  if (!tiers.length || !tiers.some((f) => f.value || f.options.length)) return null;
   const main = a.fields.find((f) => f.key === "model");
   const mainName = main && (optionFor(main, main.value)?.label || main.value);
   const follows = main ? t("same as model ({model})", { model: mainName }) : t("unconfigured tier uses first catalog model");

@@ -14,13 +14,13 @@ const models = [
 const tiers = ["opus", "sonnet", "haiku", "fable"];
 const row = (id) => `.row.agent[data-id="${id}"]`;
 
-function server(lang, writes) {
+function server(lang, writes, emptyCatalog = false) {
   let wired = true;
-  let haiku = "";
+  let haiku = emptyCatalog ? "deepseek/private-model" : "";
   const state = () => ({
     agents: [{ id: "claude-desktop", name: "Claude Desktop", icon: "claude-color", path: "/test/Claude", fields: [
       { key: "provider", label: "provider", value: wired ? "magpie" : "", options: [{ value: "magpie", label: "magpie" }] },
-      ...tiers.map((key) => ({ key, label: key, value: wired && key === "haiku" ? haiku : "", options: wired ? models : [] })),
+      ...tiers.map((key) => ({ key, label: key, value: wired && key === "haiku" ? haiku : "", options: wired && !emptyCatalog ? models : [] })),
     ] }, { id: "claude", name: "Claude Code", icon: "claudecode-color", path: "/test/.claude", fields: [
       { key: "model", label: "model", value: "deepseek/pro", options: models },
       ...tiers.map((key) => ({ key, label: key, value: "", options: models })),
@@ -50,6 +50,23 @@ function server(lang, writes) {
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
+    test(`${engine} ${lang}: clear a configured tier with an empty catalog`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+      t.after(() => browser.close());
+      const writes = [];
+      const page = await browser.newPage();
+      page.setDefaultTimeout(5000);
+      await page.route("**/*", server(lang, writes, true));
+      await page.goto("http://magpie.test/");
+      const b = page.locator(`${row("claude-desktop")} .field[data-key="tiers"]`);
+      await b.waitFor();
+      assert.match(await b.getAttribute("title"), /haiku: deepseek\/private-model/);
+      await b.click();
+      await page.locator("#list li[data-i]").filter({ hasText: "haiku" }).click();
+      await page.locator("#list li.reset").click();
+      assert.deepEqual(writes.at(-1), { agent: "claude-desktop", field: "haiku", value: "" });
+      await b.waitFor({ state: "detached" });
+    });
     test(`${engine} ${lang}: Claude Desktop tiers without a main model`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       const errors = [], writes = [];

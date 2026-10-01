@@ -387,11 +387,10 @@ func catalogFor(r *http.Request) []provider.Entry {
 
 func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 	data := []map[string]any{}
-	shown := catalogFor(r)
 	if agentOf(r) == "claude-desktop" {
 		data = desktopModels()
 	} else {
-		for _, e := range shown {
+		for _, e := range catalogFor(r) {
 			data = append(data, modelObject(e))
 		}
 	}
@@ -421,8 +420,8 @@ func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 	writeError(w, provider.Chat, 404, "unknown model "+id)
 }
 
-// unprefixed is the model magpie serves by an id Claude Desktop was given
-// for it (claudeLooking): anthropic/magpie-<number>, mythos-magpie-<number>,
+// unprefixed resolves current tier prefixes and aliases issued by earlier Desktop catalogs:
+// anthropic/magpie-<number>, mythos-magpie-<number>,
 // magpie-<number>.anthropic.<Claude model>, or, as it listed them
 // before, "anthropic/" put in front of magpie's id. An id that is magpie's
 // as it stands (a provider named anthropic) is left alone.
@@ -459,7 +458,7 @@ func (s *Server) countTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if agentOf(r) == "claude-desktop" {
-		model = desktopTurn(unprefixed(model), body)
+		model = desktopResolve(unprefixed(model), body, false)
 	}
 	// Count the same masked prompt that generation sends to the vendor.
 	w, body, unmask := redacted(w, body)
@@ -1280,6 +1279,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	asked := bodyEffort(proto, body)
 	if e := fitFor(p, model, asked); asked != "" && e != asked {
 		body = withBodyEffort(proto, body, e)
+	}
+	if proto == provider.Anthropic {
+		body = withClaudeThinking(body, model)
 	}
 	path := pathOf(proto)
 	if proto == provider.Anthropic && p.Account == nil && fromClaudeCode(r.Header) && r.URL.Query().Get("beta") == "true" {

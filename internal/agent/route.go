@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -92,6 +94,21 @@ func group(name string, opts []Option) []Option {
 		opts[i].Group = name
 	}
 	return opts
+}
+
+// StandIn resolves an agent's configured replacement; an empty value leaves fallback to the gateway.
+func StandIn(agent, model string) string {
+	if agent != "claude" && agent != "claude-desktop" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	if agent == "claude-desktop" {
+		return desktopStandIn(home, model)
+	}
+	return claudeStandIn(filepath.Join(home, ".claude", "settings.json"), model)
 }
 
 func gatewayV1() string { return gateway.URL() + "/v1" }

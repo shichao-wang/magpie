@@ -110,7 +110,8 @@ sideways; no left-border stripe; in English and Chinese, light and dark.
 
 `desktop-tiers.test.cjs` opens Claude Desktop's four-tier menu without a main
 model field, checks that empty tiers use the first available catalog model in
-English and Chinese, chooses and clears a tier model, and hides the menu after disconnecting.
+English and Chinese, chooses and clears a tier model (including a configured model
+with an empty catalog), and hides the menu after disconnecting.
 Claude Code's existing main-model fallback remains distinct.
 
 With Node.js and Playwright available:

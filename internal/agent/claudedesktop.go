@@ -204,6 +204,49 @@ func claudeDesktop(home string) *Agent {
 	}
 }
 
+func desktopStandIn(home, model string) string {
+	tier := gateway.DesktopTier(model)
+	if tier == "" {
+		return ""
+	}
+	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	if !desktopWired(p) {
+		return ""
+	}
+	v, _ := edit.GetJSON(desktopTiersPath(), tier)
+	if isMagpie(v) {
+		return v
+	}
+	return ""
+}
+
+// DesktopTiers reads all four choices once for a model discovery request.
+func DesktopTiers() map[string]string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	return desktopTiers(home)
+}
+
+func desktopTiers(home string) map[string]string {
+	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	if !desktopWired(p) {
+		return nil
+	}
+	b, err := edit.Read(desktopTiersPath())
+	var tiers map[string]string
+	if err != nil || json.Unmarshal(b, &tiers) != nil {
+		return nil
+	}
+	for tier, model := range tiers {
+		if !isMagpie(model) {
+			delete(tiers, tier)
+		}
+	}
+	return tiers
+}
+
 // Desktop has no native tier settings. Keep magpie's choices beside its own
 // settings, not as keys Desktop might rewrite in the gateway profile.
 func desktopTiersPath() string { return filepath.Join(settings.Dir(), "claude-desktop-tiers.json") }

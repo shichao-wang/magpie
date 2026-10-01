@@ -117,6 +117,7 @@ func run(args []string) error {
 	// Claude Code's unserved tier names and Claude Desktop's session and
 	// auxiliary tiers go to the model set for them
 	gateway.StandIn = agent.StandIn
+	gateway.DesktopTiers = agent.DesktopTiers
 	// the setup kept the same on every computer, by whichever serves
 	gateway.WhileServing = append(gateway.WhileServing, davsync.Run)
 	if len(args) == 0 {

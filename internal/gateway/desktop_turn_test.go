@@ -162,16 +162,35 @@ func TestClaudeDesktopTiers(t *testing.T) {
 	if got := send("claude-desktop", aliasFor("fake/m2"), true); got != "m2" {
 		t.Fatalf("legacy session: %q", got)
 	}
-	// Counting normalizes the same tier ids before selecting the upstream.
+	// An unset historical Haiku request uses the same default as the fixed alias.
+	delete(chosen, "haiku")
+	send("claude-desktop", "mythos-magpie-opus", true)
+	for _, asked := range []string{"claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022", "haiku", "claude-haiku-magpie"} {
+		if got := send("claude-desktop", asked, false); got != "m1" {
+			t.Fatalf("unset historical haiku %s: %q", asked, got)
+		}
+	}
+	// Counting normalizes tier ids, including requests with tools, without picking a session model.
+	send("claude-desktop", "fake/m2", true)
+	pickedBefore, err := os.ReadFile(desktopPickedPath())
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.reply, f.ctype = `{"input_tokens":7}`, "application/json"
 	for _, asked := range []string{"mythos-magpie-opus", "anthropic/mythos-magpie-opus", "mythos-magpie-opus[1m]", "claude-opus-5", "opus", "anthropic/claude-opus-5", "claude-opus-5[1m]"} {
-		req := httptest.NewRequest("POST", "/v1/messages/count_tokens", strings.NewReader(`{"model":"`+asked+`","messages":[{"role":"user","content":"hi"}]}`))
+		req := httptest.NewRequest("POST", "/v1/messages/count_tokens", strings.NewReader(`{"model":"`+asked+`","tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}`))
 		req.Header.Set("x-api-key", TokenFor("claude-desktop"))
 		rec := httptest.NewRecorder()
 		New().Handler().ServeHTTP(rec, req)
 		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"input_tokens":7`) || modelOf(f.got) != "m4" || f.path != "/v1/messages/count_tokens" {
 			t.Fatalf("count %s: %d %s, upstream %s %s", asked, rec.Code, rec.Body, f.path, f.got)
 		}
+		if pickedAfter, _ := os.ReadFile(desktopPickedPath()); string(pickedAfter) != string(pickedBefore) || desktopSelection("") != "fake/m2" {
+			t.Fatalf("count %s changed the session choice: %q", asked, pickedAfter)
+		}
+	}
+	if got := desktopTurn("claude-sonnet-5-thinking", []byte(`{"max_tokens":200}`)); got != "fake/m2" {
+		t.Fatalf("legacy auxiliary request after counting: %q", got)
 	}
 }
 

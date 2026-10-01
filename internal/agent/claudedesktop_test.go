@@ -210,6 +210,18 @@ func TestClaudeDesktopTiers(t *testing.T) {
 	if err := a.Field("opus").Set("deepseek/pro"); err != nil {
 		t.Fatal(err)
 	}
+	if got := DesktopTiers(); got["haiku"] != "deepseek/flash" || got["opus"] != "deepseek/pro" {
+		t.Fatalf("discovery snapshot: %v", got)
+	}
+	for _, model := range []string{"claude-haiku-magpie", "anthropic/mythos-magpie-opus[1m]"} {
+		want := "deepseek/flash"
+		if gateway.DesktopTier(model) == "opus" {
+			want = "deepseek/pro"
+		}
+		if got := StandIn("claude-desktop", model); got != want {
+			t.Fatalf("%s: %q, want %q", model, got, want)
+		}
+	}
 	if prof := desktopJSON(t, p.prof); prof["haiku"] != nil || prof["opus"] != nil || prof["magpieTiers"] != nil {
 		t.Fatalf("tiers leaked into Desktop's profile: %v", prof)
 	}
