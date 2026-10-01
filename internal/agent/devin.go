@@ -103,7 +103,7 @@ func devinSplit(id string) (model, effort string) {
 	if id == "" {
 		return "", ""
 	}
-	families, err := providerDevinFamilies(context.Background())
+	families, err := providerDevinFamilies(provider.DevinNoWait(context.Background()))
 	if err != nil {
 		return id, ""
 	}
@@ -113,7 +113,7 @@ func devinSplit(id string) (model, effort string) {
 // devinEfforts are the levels the model the picker shows has, none for one
 // at no effort (glm-5-2-1m) or one Devin's list doesn't have.
 func devinEfforts(model string) []string {
-	families, err := providerDevinFamilies(context.Background())
+	families, err := providerDevinFamilies(provider.DevinNoWait(context.Background()))
 	if err != nil {
 		return nil
 	}
@@ -131,7 +131,7 @@ func devinEfforts(model string) []string {
 // borrowed ones, so like every agent's own list they sit flat — a group
 // each would only crowd the picker's rail with one icon per family.
 func devinOptions(cur string) []Option {
-	families, err := providerDevinFamilies(context.Background())
+	families, err := providerDevinFamilies(provider.DevinNoWait(context.Background()))
 	if err != nil {
 		if cur == "" {
 			return nil

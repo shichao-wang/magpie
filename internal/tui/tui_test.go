@@ -24,7 +24,7 @@ func home(t *testing.T) string {
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
 	t.Setenv("PATH", "")
 	t.Setenv("XDG_DATA_HOME", filepath.Join(h, ".local", "share"))
-	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "APPDATA", "VISUAL", "EDITOR", "OPENCODE_DB", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"} {
+	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "APPDATA", "VISUAL", "EDITOR", "OPENCODE_DB", "PI_CODING_AGENT_DIR", "OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"} {
 		t.Setenv(k, "")
 	}
 	for _, f := range []string{".claude/settings.json", ".codex/config.toml"} {
@@ -179,6 +179,13 @@ func TestRoutingPage(t *testing.T) {
 	g = group(t, "opus")
 	if g.Classifier != "b/gpt-5.5" || g.Routing != provider.Ordered || g.Affinity != provider.AffinitySession || g.Context != 300000 {
 		t.Fatalf("group %+v", g)
+	}
+	// the levels agents are offered (#295)
+	m = press(t, m, "l")
+	m = typeIn(m, "xhigh,medium")
+	m = press(t, m, "enter")
+	if g := group(t, "opus"); !slices.Equal(g.Levels, []string{"medium", "xhigh"}) {
+		t.Fatalf("levels %v", g.Levels)
 	}
 
 	// d twice removes the rule picked; a model taken out takes its rules

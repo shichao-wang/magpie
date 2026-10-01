@@ -80,6 +80,7 @@ type Tool struct {
 	Name        string
 	Description string
 	Schema      json.RawMessage // JSON schema of the arguments
+	Strict      bool            // the client asked for its arguments held to the schema
 }
 
 // Request is a call to a model, whichever API it arrived in.
@@ -107,14 +108,39 @@ type Request struct {
 	// id), which OpenAI, and relays in front of it, route a conversation by
 	// to where its prompt is cached.
 	CacheKey string
+	// Include is a Responses client's include, the extra output it asked
+	// for (Codex's reasoning.encrypted_content), which a Responses upstream
+	// is asked for too: a relay may refuse a request without it (#315).
+	Include []string
+	// ClientMetadata and Text are a Responses client's client_metadata
+	// (Codex's installation and session ids, which a relay may check, #374)
+	// and text (its verbosity, and the schema an answer must fit), which go
+	// on as they were sent when the request is built again for a Responses
+	// upstream; no other API takes them.
+	ClientMetadata json.RawMessage
+	Text           json.RawMessage
+	// Metadata is an Anthropic client's metadata (Claude Code's user_id),
+	// which goes on as it was sent when the request is built again for an
+	// Anthropic upstream: a relay that serves only Claude Code turns a
+	// request without it away (#359).
+	Metadata json.RawMessage
+	// GeminiCompat is the upstream being Gemini's OpenAI-compatible API
+	// (AI Studio's, or a proxy in front of it on this machine or the LAN),
+	// which gives the model's thoughts only when asked in thinking_config.
+	GeminiCompat bool
 	// Namespaced are the tools a Responses client offered inside a
 	// namespace, by the flat name the model is offered them under.
 	Namespaced map[string]nsTool
 }
 
 // nsTool is a tool as a Responses client knows it: by its namespace and its
-// name in it (Codex's collaboration.spawn_agent).
-type nsTool struct{ Namespace, Name string }
+// name in it (Codex's collaboration.spawn_agent). Search is Codex's own
+// tool search, offered to the model as a function and handed back as the
+// tool_search_call Codex runs.
+type nsTool struct {
+	Namespace, Name string
+	Search          bool
+}
 
 // EventKind is what a streamed event carries.
 type EventKind int
@@ -142,8 +168,13 @@ type Event struct {
 	MsgID  string
 	Model  string
 	Stop   string // stop | length | tool | filter
-	Usage  Usage
-	Hits   []Hit
+	// Code: for KError, the source error or safety-filter code (rate_limit,
+	// server_error, bio_policy, content_filter…); RequestID: the vendor's id for the
+	// request the event is of, when it is known by then
+	Code      string
+	RequestID string
+	Usage     Usage
+	Hits      []Hit
 }
 
 // Usage counts tokens.
@@ -156,6 +187,11 @@ type Usage struct {
 	// Served: the model the vendor's reply says answered, when it named
 	// one — which may not be the one it was asked for
 	Served string `json:"served,omitempty"`
+	// RequestID: the id the vendor gave the request, from its reply's
+	// headers (Claude Code's own for a subscription); ErrType: what a
+	// failed request's error body called the error
+	RequestID string `json:"request_id,omitempty"`
+	ErrType   string `json:"err_type,omitempty"`
 }
 
 // prompt is every token the prompt came to, as OpenAI's and Gemini's
@@ -184,6 +220,12 @@ func (u *Usage) add(v Usage) {
 	if v.Served != "" {
 		u.Served = v.Served
 	}
+	if v.RequestID != "" {
+		u.RequestID = v.RequestID
+	}
+	if v.ErrType != "" {
+		u.ErrType = v.ErrType
+	}
 }
 
 // Result is a whole reply, for non-streaming clients.
@@ -201,6 +243,9 @@ type collector struct {
 	res  Result
 	args strings.Builder // arguments of the open tool call
 	err  string
+	// the error's status and kind, as its event gave them
+	errStatus int
+	errCode   string
 }
 
 func (c *collector) last(k Kind) *Part {
@@ -254,8 +299,9 @@ func (c *collector) add(ev Event) {
 		c.res.Stop = ev.Stop
 	case KUsage:
 		c.res.Usage.add(ev.Usage)
+		c.res.Usage.add(Usage{RequestID: ev.RequestID})
 	case KError:
-		c.err = ev.Text
+		c.err, c.errStatus, c.errCode = ev.Text, ev.Status, ev.Code
 	case KSearch:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Search, Text: ev.Text, Hits: ev.Hits})

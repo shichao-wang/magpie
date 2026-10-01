@@ -224,3 +224,40 @@ func TestWarmAtWithTheResetWarmUp(t *testing.T) {
 		t.Fatalf("sent %d times", len(f.sent))
 	}
 }
+
+// A weekly window resetting while the 5-hour one isn't running, less than
+// five hours before the daily time, waits for it: its request would start
+// the 5-hour window too, to run past the time (#246). With no daily time,
+// or the 5-hour window running, it goes at once.
+func TestWeeklyWarmUpWaitsForTheDay(t *testing.T) {
+	for _, which := range []string{"week", "all"} {
+		path := filepath.Join(t.TempDir(), "warmup.json")
+		f := &fakeWarm{now: at8(29, 8, 32), errs: map[string]error{}}
+		idleWindows := func() []QuotaWindow {
+			return []QuotaWindow{win("5 hours", fiveHours, 0, f.now.Add(fiveHours)), win("7 days", week, 0, f.now.Add(week))}
+		}
+		f.ws = map[string][]QuotaWindow{"a@example.com": idleWindows()}
+		if rs := f.runAt(t, path, which, "09:30"); len(rs) != 0 {
+			t.Errorf("%s: at 08:32 sent %+v, starting the 5-hour window before 09:30", which, rs)
+		}
+		f.now = at8(29, 9, 30)
+		f.ws["a@example.com"] = idleWindows()
+		if rs := f.runAt(t, path, which, "09:30"); len(rs) != 1 || len(rs[0].Windows) != 2 {
+			t.Errorf("%s: at 09:30 sent %+v, want one request for both windows", which, rs)
+		}
+
+		// no daily time: at once
+		f = &fakeWarm{now: at8(29, 8, 32), errs: map[string]error{}}
+		f.ws = map[string][]QuotaWindow{"a@example.com": idleWindows()}
+		if rs := f.runAt(t, filepath.Join(t.TempDir(), "warmup.json"), which, ""); len(rs) != 1 {
+			t.Errorf("%s: no daily time, sent %+v, want the weekly warm-up at once", which, rs)
+		}
+
+		// the 5-hour window running: the weekly one at once
+		f = &fakeWarm{now: at8(29, 8, 32), errs: map[string]error{}}
+		f.ws = map[string][]QuotaWindow{"a@example.com": {win("5 hours", fiveHours, 30, f.now.Add(2*time.Hour)), win("7 days", week, 0, f.now.Add(week))}}
+		if rs := f.runAt(t, filepath.Join(t.TempDir(), "warmup.json"), which, "09:30"); len(rs) != 1 || len(rs[0].Windows) != 1 || rs[0].Windows[0] != "7 days" {
+			t.Errorf("%s: 5-hour window running, sent %+v, want the weekly warm-up at once", which, rs)
+		}
+	}
+}

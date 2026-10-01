@@ -2,11 +2,14 @@ package provider
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +18,7 @@ import (
 func TestStoreIcon(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 
 	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
@@ -52,6 +56,7 @@ func TestStoreIcon(t *testing.T) {
 func TestFetchIcon(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 
 	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
@@ -104,10 +109,12 @@ func TestFetchIcon(t *testing.T) {
 }
 
 func TestPublicIP(t *testing.T) {
-	public := []string{"93.184.216.34", "8.8.8.8", "2606:4700:4700::1111"}
+	// 198.18/15 is what fake-ip proxies (Clash TUN, Surge's enhanced mode)
+	// answer with, carrying the connection to the real host (#252)
+	public := []string{"93.184.216.34", "8.8.8.8", "2606:4700:4700::1111", "198.18.0.5", "198.19.255.254"}
 	private := []string{
 		"127.0.0.1", "::1", "10.0.0.1", "192.168.1.1", "172.16.0.1", "169.254.1.1",
-		"0.0.0.0", "100.64.0.1", "192.0.0.1", "192.0.2.1", "198.18.0.1", "198.51.100.1",
+		"0.0.0.0", "100.64.0.1", "192.0.0.1", "192.0.2.1", "198.51.100.1",
 		"203.0.113.1", "224.0.0.1", "fc00::1", "fe80::1", "2002::1",
 	}
 	for _, s := range public {
@@ -119,6 +126,53 @@ func TestPublicIP(t *testing.T) {
 		if publicIP(net.ParseIP(s)) {
 			t.Errorf("%s judged public", s)
 		}
+	}
+}
+
+func TestIconIPsLoon(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		ips  []string
+		want []string // nil means the entire answer must be refused
+	}{
+		{"screenshot", []string{"fd27:712::c600:1061", "198.0.16.97"}, []string{"198.0.16.97"}},
+		{"ipv4 first", []string{"198.0.16.97", "fd27:712::c600:1061"}, []string{"198.0.16.97"}},
+		{"benchmark pool", []string{"fd27:712::c612:139", "198.18.1.57"}, []string{"198.18.1.57"}},
+		{"public dual stack", []string{"8.8.8.8", "2606:4700:4700::1111"}, []string{"8.8.8.8", "2606:4700:4700::1111"}},
+		{"unpaired", []string{"fd27:712::c600:1061"}, nil},
+		{"unrelated ipv4", []string{"fd27:712::c600:1061", "8.8.8.8"}, nil},
+		{"private pair", []string{"fd27:712::a00:1", "10.0.0.1"}, nil},
+		{"loopback pair", []string{"fd27:712::7f00:1", "127.0.0.1"}, nil},
+		{"other ula", []string{"fd27:712:1::c600:1061", "198.0.16.97"}, nil},
+		{"mixed private", []string{"fd27:712::c600:1061", "198.0.16.97", "192.168.1.1"}, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var ips []net.IPAddr
+			for _, ip := range tt.ips {
+				ips = append(ips, net.IPAddr{IP: net.ParseIP(ip)})
+			}
+			allowed, err := iconIPs("api.example.com", ips)
+			if tt.want == nil {
+				if err == nil || len(allowed) != 0 {
+					t.Fatalf("private answer accepted: %v, %v", allowed, err)
+				}
+				return
+			}
+			var got []string
+			for _, ip := range allowed {
+				if !publicIP(ip.IP) {
+					t.Fatalf("private address passed to dial: %v", ip)
+				}
+				got = append(got, ip.IP.String())
+			}
+			if err != nil || !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("got %v, %v; want %v", got, err, tt.want)
+			}
+		})
+	}
+	// Explicit private-IP URLs remain invalid, including Loon-shaped ones.
+	if _, err := iconURL("https://[fd27:712::c600:1061]/favicon.ico"); err == nil {
+		t.Fatal("literal ULA icon URL accepted")
 	}
 }
 
@@ -169,5 +223,69 @@ func TestPublicDialAllowsPublic(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("dialed a private address anyway: %q", got)
+	}
+}
+
+// With Clash's TUN (fake-ip) or Surge's enhanced mode on, every name
+// resolves into 198.18.0.0/15 and the proxy carries the connection on (#252):
+// the dial-time guard has to let that through, while loopback, private,
+// link-local and carrier-NAT addresses are still refused before any dial.
+func TestPublicDialFakeIP(t *testing.T) {
+	var got string
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		got = addr
+		return nil, errorf("connection refused for the test")
+	}
+	for _, ip := range []string{"198.18.0.5", "198.19.0.200"} {
+		got = ""
+		_, err := publicDial(context.Background(), dial, "tcp", net.JoinHostPort(ip, "443"))
+		if got != net.JoinHostPort(ip, "443") || err == nil || strings.Contains(err.Error(), "not public") {
+			t.Errorf("fake-ip %s: dialed %q, %v", ip, got, err)
+		}
+	}
+	for _, ip := range []string{"127.0.0.1", "10.1.2.3", "192.168.1.10", "169.254.169.254", "100.64.0.1"} {
+		got = ""
+		_, err := publicDial(context.Background(), dial, "tcp", net.JoinHostPort(ip, "443"))
+		if err == nil || !strings.Contains(err.Error(), "not public") || got != "" {
+			t.Errorf("%s: dialed %q, %v", ip, got, err)
+		}
+	}
+}
+
+// Through a proxy on this computer (Clash's 127.0.0.1:7890, #252) the
+// fetch reaches the proxy, which fetches the public site; a site that is
+// not public is still refused before the proxy is asked.
+func TestGuardClientThroughLocalProxy(t *testing.T) {
+	var asked []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.String())
+		rw.Write([]byte("icon"))
+	}))
+	defer proxy.Close()
+	pu, _ := url.Parse(proxy.URL)
+	dt := http.DefaultTransport.(*http.Transport)
+	old := dt.Proxy
+	dt.Proxy = http.ProxyURL(pu)
+	defer func() { dt.Proxy = old }()
+
+	req, _ := http.NewRequest(http.MethodGet, "http://203.0.114.5/favicon.ico", nil)
+	resp, err := guardClient().Do(req)
+	if err != nil {
+		t.Fatalf("a public site through a local proxy was refused: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "icon" || len(asked) != 1 || asked[0] != "http://203.0.114.5/favicon.ico" {
+		t.Fatalf("got %q, proxy asked %v", body, asked)
+	}
+
+	for _, u := range []string{"http://10.1.2.3/x.png", "http://192.168.1.10/x.png"} {
+		req, _ := http.NewRequest(http.MethodGet, u, nil)
+		if _, err := guardClient().Do(req); err == nil || !strings.Contains(err.Error(), "not public") {
+			t.Errorf("%s through the proxy: %v", u, err)
+		}
+	}
+	if len(asked) != 1 {
+		t.Fatalf("the proxy was asked for a private site: %v", asked)
 	}
 }

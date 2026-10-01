@@ -54,28 +54,85 @@ func DevinCredentialsPath() string {
 	return filepath.Join(base, "devin", "credentials.toml")
 }
 
-var devinStatus = &cliIdentity{name: "devin", exe: func() string { return DevinExecutable() }, ask: func() (string, string, bool, error) { u, p, ok := askDevinIdentity(); return u, p, ok, nil }}
+var devinStatus = &cliIdentity{name: "devin", exe: func() string { return DevinExecutable() }, ask: askDevinStatus}
 
 // devinIdentity is who Devin's CLI says is signed in; see cliIdentity.
 func devinIdentity() (user, plan string, ok bool) { return devinStatus.get() }
 
 func forgetDevinStatus() { devinStatus.forget() }
 
-func askDevinIdentity() (user, plan string, ok bool) { return askDevinIdentityAt("") }
+// devinIdentityTimeout is how long `devin auth status` is given: it asks
+// Devin's servers, and on a real one took 3 to 11 seconds — the 10 seconds
+// it had dropped the account now and then.
+const devinIdentityTimeout = 30 * time.Second
 
-// askDevinIdentityAt asks the CLI who is signed in in home ("" for its own).
+// askDevinStatus asks the CLI who is signed in. An ask that fails, runs out
+// of time (it asks Devin's servers) or prints something else couldn't tell,
+// and the account stays as it was (#154): only a CLI that says nobody is,
+// whose account's token was refused, or that keeps no credentials.toml, is
+// sure of nobody.
+func askDevinStatus() (user, plan string, ok bool, err error) { return askDevinStatusAt("") }
+
+// askDevinIdentity is who the CLI says is signed in, sure or not: the
+// sign-in has just written the credentials and has to name the account.
+func askDevinIdentity() (user, plan string, ok bool) {
+	u, p, ok, _ := askDevinStatusAt("")
+	return u, p, ok
+}
+
+// askDevinIdentityAt is askDevinIdentity for the account signed in in home
+// ("" for the CLI's own).
 func askDevinIdentityAt(home string) (user, plan string, ok bool) {
+	u, p, ok, _ := askDevinStatusAt(home)
+	return u, p, ok
+}
+
+// askDevinStatusAt asks the CLI who is signed in in home ("" for its own).
+func askDevinStatusAt(home string) (user, plan string, ok bool, err error) {
 	path := DevinExecutable()
 	if path == "" {
-		return "", "", false
+		return "", "", false, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), devinIdentityTimeout)
 	defer cancel()
 	out, err := devinCommand(ctx, home, path, "auth", "status").Output()
-	if err != nil {
-		return "", "", false
+	user, plan, _ = parseDevinStatus(string(out))
+	switch {
+	case user != "":
+		return user, plan, true, nil
+	case devinSignedOut(string(out)), noDevinKey(home):
+		return "", "", false, nil
+	case err == nil:
+		err = errors.New("devin auth status printed no account")
 	}
-	return parseDevinStatus(string(out))
+	return "", "", false, err
+}
+
+// devinSignedOut says the CLI's own report is one of nobody signed in: it
+// says so itself, or Devin's servers refused the account's token (a revoked
+// or expired one) and the CLI prints that inside a report that still begins
+// `Logged in`, with no account in it. A CLI that couldn't reach them says
+// `Connection failed` instead, and one that ran out of time says nothing:
+// neither is this, and both keep the account served (#154).
+func devinSignedOut(out string) bool {
+	for _, said := range []string{
+		"Not logged in",
+		"Authentication required",
+		"Invalid token",
+		"try logging out and logging in again",
+	} {
+		if strings.Contains(out, said) {
+			return true
+		}
+	}
+	return false
+}
+
+// noDevinKey says the account signed in in home keeps no credentials: the
+// CLI can only be sure of nobody, whatever it printed.
+func noDevinKey(home string) bool {
+	_, _, err := DevinAuthAt(home)
+	return err != nil
 }
 
 // parseDevinStatus reads `devin auth status`'s report:
@@ -309,22 +366,97 @@ var devinFamiliesCache struct {
 	sync.Mutex
 	at       time.Time
 	families []DevinFamily
+	// failed is when the CLI last gave no list, and err what it said: a
+	// CLI signed out, or one that can't reach Devin, is asked again only
+	// after devinFamiliesRetry, not on every call
+	failed time.Time
+	err    error
+	// asking is closed when the ask in flight ends; nil with none
+	asking chan struct{}
 }
 
+const (
+	devinFamiliesFresh = 5 * time.Minute
+	devinFamiliesRetry = time.Minute
+)
+
+type devinNoWaitKey struct{}
+
+// DevinNoWait marks a context whose caller must not wait on the devin CLI:
+// the window's state, drawn after every click. DevinFamilies then answers
+// with what it knows (or an error while nothing is known) and asks the
+// CLI in the background, so the next state has it.
+func DevinNoWait(ctx context.Context) context.Context {
+	return context.WithValue(ctx, devinNoWaitKey{}, true)
+}
+
+var errDevinAsking = errors.New("devin models list: still being read")
+
 // DevinFamilies is the CLI's model list, kept a few minutes: the picker and
-// the provider ask for it often and `devin models list` spawns a process.
+// the provider ask for it often and `devin models list` spawns a process
+// that takes seconds (switching Claude Code's model took 5–10s while
+// every state asked it anew). A list past its time is served as it is
+// while it is read again in the background; only a caller with nothing
+// known yet waits, and not one marked DevinNoWait.
 func DevinFamilies(ctx context.Context) ([]DevinFamily, error) {
-	devinFamiliesCache.Lock()
-	defer devinFamiliesCache.Unlock()
-	if time.Since(devinFamiliesCache.at) < 5*time.Minute && len(devinFamiliesCache.families) > 0 {
-		return devinFamiliesCache.families, nil
+	c := &devinFamiliesCache
+	c.Lock()
+	if len(c.families) > 0 {
+		if time.Since(c.at) >= devinFamiliesFresh && time.Since(c.failed) >= devinFamiliesRetry {
+			devinAskLocked()
+		}
+		f := c.families
+		c.Unlock()
+		return f, nil
 	}
-	families, err := askDevinFamilies(ctx)
-	if err != nil {
+	if time.Since(c.failed) < devinFamiliesRetry {
+		err := c.err
+		c.Unlock()
 		return nil, err
 	}
-	devinFamiliesCache.families, devinFamiliesCache.at = families, time.Now()
-	return families, nil
+	done := devinAskLocked()
+	c.Unlock()
+	if ctx.Value(devinNoWaitKey{}) != nil {
+		return nil, errDevinAsking
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	c.Lock()
+	defer c.Unlock()
+	if len(c.families) > 0 {
+		return c.families, nil
+	}
+	if c.err == nil {
+		return nil, errDevinAsking
+	}
+	return nil, c.err
+}
+
+// devinAskLocked starts reading the CLI's list, unless a read is under
+// way; the channel closes when it ends. devinFamiliesCache is held.
+func devinAskLocked() chan struct{} {
+	c := &devinFamiliesCache
+	if c.asking != nil {
+		return c.asking
+	}
+	done := make(chan struct{})
+	c.asking = done
+	go func() {
+		families, err := askDevinFamilies(context.Background())
+		c.Lock()
+		if err != nil {
+			c.failed, c.err = time.Now(), err
+		} else {
+			c.families, c.at, c.failed, c.err = families, time.Now(), time.Time{}, nil
+		}
+		c.asking = nil
+		close(done)
+		c.Unlock()
+	}()
+	return done
 }
 
 // devinCached is the CLI list last read, without asking it again.
@@ -337,10 +469,39 @@ func devinCached() []DevinFamily {
 func devinFamiliesCached(families []DevinFamily) {
 	devinFamiliesCache.Lock()
 	devinFamiliesCache.families, devinFamiliesCache.at = families, time.Now()
+	devinFamiliesCache.failed, devinFamiliesCache.err = time.Time{}, nil
 	devinFamiliesCache.Unlock()
 }
 
-func askDevinFamilies(ctx context.Context) ([]DevinFamily, error) { return askDevinFamiliesAt(ctx, "") }
+// askDevinFamilies is the model list as the accounts signed in give it, the
+// one in use first: an account magpie signed in is asked in its own home,
+// not the CLI's, which may be signed out (蓝猫 on Discord: with only a
+// magpie sign-in every request failed, as the family's id went to Devin
+// unturned into a variant, until `devin auth login`). The CLI's own is
+// asked last when it isn't among them, as it was before there were homes.
+func askDevinFamilies(ctx context.Context) ([]DevinFamily, error) {
+	var homes []string
+	for _, l := range devinLogins() {
+		homes = append(homes, l.Home)
+	}
+	if !slices.Contains(homes, "") {
+		homes = append(homes, "")
+	}
+	var first error
+	for _, home := range homes {
+		families, err := askDevinFamiliesAt(ctx, home)
+		if err == nil {
+			return families, nil
+		}
+		if first == nil {
+			first = err
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, first
+}
 
 // askDevinFamiliesAt is the model list of the account signed in in home
 // ("" for the CLI's own).

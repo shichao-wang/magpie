@@ -10,6 +10,21 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
+// desktopCatalogKey is Desktop's tC/zC normalization (2.9939.2): both
+// catalog names and built-in effort capabilities use this key.
+func desktopCatalogKey(id string) string {
+	e := strings.ToLower(id)
+	t := regexp.MustCompile(`^arn:aws[a-z-]*:bedrock:[^/]+/`).ReplaceAllString(e, "")
+	t = regexp.MustCompile(`^(?:[a-z][a-z0-9-]*\.)?anthropic\.`).ReplaceAllString(t, "")
+	stripped := t != e || regexp.MustCompile(`^claude-(?:[a-z]+-)?\d`).MatchString(t)
+	t = regexp.MustCompile(`\[[^\]]+\]$`).ReplaceAllString(t, "")
+	if stripped {
+		t = regexp.MustCompile(`-v\d+(?::\d+)?$`).ReplaceAllString(t, "")
+	}
+	t = regexp.MustCompile(`@\d{8}$`).ReplaceAllString(t, "")
+	return regexp.MustCompile(`-\d{8}$`).ReplaceAllString(t, "")
+}
+
 // desktopPicker is Claude Desktop's tIt (index.chunk-D3OyLXgG.js, 2.7032):
 // whether the model id it was given gets a thinking-effort picker. IC is
 // qS of the lowercased id; HFt's keys that have effort levels, and UFt.
@@ -162,6 +177,45 @@ func TestClaudeDesktopEffortReachesModel(t *testing.T) {
 		}
 		if sent.Model != "m1" || sent.OutputConfig.Effort != c.sent {
 			t.Errorf("%s: sent %s at %q, want m1 at %q", c.asked, sent.Model, sent.OutputConfig.Effort, c.sent)
+		}
+	}
+}
+
+// Desktop's selector gives a matching catalog or hybrid name precedence over
+// discovery's display_name (pVt/cUt, 2.9939.2). Tier aliases must not normalize
+// to standard model ids, including when the client adds [1m].
+func TestClaudeDesktopTierCatalogNames(t *testing.T) {
+	setup(t, provider.Anthropic, &fake{})
+	before := DesktopTiers
+	DesktopTiers = func() map[string]string {
+		return map[string]string{"opus": "fake/m1", "sonnet": "fake/m1", "haiku": "fake/m1", "fable": "fake/m1"}
+	}
+	t.Cleanup(func() { DesktopTiers = before })
+	catalog := map[string]string{
+		"claude-opus-5": "Opus 5", "claude-sonnet-5": "Sonnet 5",
+		"claude-haiku-4-5": "Haiku 4.5", "claude-fable-5": "Fable 5",
+	}
+	pickerName := func(id, name string) string {
+		if override := catalog[desktopCatalogKey(id)]; override != "" {
+			return override
+		}
+		return name
+	}
+	if pickerName("magpie.anthropic.claude-opus-5", "My model") != "Opus 5" {
+		t.Fatal("standard model no longer reproduces the catalog name override")
+	}
+	for _, m := range desktopTierModels() {
+		id, name := m["id"].(string), m["display_name"].(string)
+		if m["anthropic_family_tier"] != DesktopTier(id) {
+			t.Errorf("%s: wrong family tier %v", id, m["anthropic_family_tier"])
+		}
+		for _, asked := range []string{id, id + "[1m]"} {
+			if got := pickerName(asked, name); got != name {
+				t.Errorf("%s: catalog replaced %q with %q", asked, name, got)
+			}
+			if desktopPicker(asked) != m["reasoning"].(bool) {
+				t.Errorf("%s: effort capabilities changed", asked)
+			}
 		}
 	}
 }

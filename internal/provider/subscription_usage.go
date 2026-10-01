@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/yetone/magpie/internal/netproxy"
 )
 
 // QuotaWindow is one rolling allowance reported by a subscription provider.
@@ -24,6 +26,11 @@ type QuotaWindow struct {
 	ResetsAt  *time.Time `json:"resetsAt,omitempty"`
 	ResetSecs int64      `json:"resetSecs,omitempty"`
 	Display   string     `json:"display,omitempty"`
+	// Family is the model family a per-model window belongs to (Antigravity's
+	// "Gemini 3.1 Pro (High)" is Gemini's), for the GUI to show one figure a
+	// family, the tightest; each window is still here, and routing reads
+	// them one by one.
+	Family string `json:"family,omitempty"`
 
 	// For routing (see Allowances): how long the window runs, zero when
 	// not known; the only models it counts, by a word in their ids
@@ -56,8 +63,8 @@ type SubscriptionQuota struct {
 	// AsOf is when an allowance shown in place of one that couldn't be
 	// read was read (see keepLast); nil for a reading just made.
 	AsOf *time.Time `json:"asOf,omitempty"`
-	// Resets are the rate-limit resets a Codex account holds, nil when
-	// it holds none (codex_resets.go).
+	// Resets are the rate-limit resets a Codex account holds, nil when it
+	// holds none (codex_resets.go).
 	Resets *ResetCredits `json:"resets,omitempty"`
 }
 
@@ -66,6 +73,7 @@ var subscriptionUsageCache struct {
 	at      time.Time
 	data    []SubscriptionQuota
 	pending chan struct{} // closed when the refresh in flight is done
+	asked   bool          // the user asked (AskClaudeUsage): wait for the refresh
 }
 
 // OnSubscriptionUsage is told when a refresh has landed, for what shows a
@@ -74,7 +82,8 @@ var OnSubscriptionUsage func()
 
 // subscriptionTimeout bounds one refresh; the vendors' endpoints can be
 // unreachable without a proxy, and then each fetch would hang to it.
-var subscriptionTimeout = 10 * time.Second
+// A plugin's account waits as long as the plugin itself does (20s).
+var subscriptionTimeout = 20 * time.Second
 
 // SubscriptionUsage returns rolling quotas for signed-in first-party agents.
 // Results are cached because these private account endpoints are aggressively
@@ -85,13 +94,20 @@ func SubscriptionUsage(ctx context.Context) []SubscriptionQuota {
 	c := &subscriptionUsageCache
 	c.Lock()
 	have, fresh := c.data != nil, time.Since(c.at) < time.Minute
+	if c.asked {
+		have, c.asked = false, false
+	}
 	if !fresh && c.pending == nil {
 		done := make(chan struct{})
 		c.pending = done
 		go func() {
+			start := time.Now()
 			out := fetchSubscriptionUsage()
 			c.Lock()
 			c.at, c.data, c.pending = time.Now(), out, nil
+			if claudeAsked.Load() > start.UnixNano() {
+				c.at = time.Time{} // asked meanwhile: read again
+			}
 			c.Unlock()
 			close(done)
 			if f := OnSubscriptionUsage; f != nil {
@@ -184,74 +200,113 @@ func chosenWindows(ws []QuotaWindow, chosen map[string]bool, base func(string) s
 
 // fetchSubscriptionUsage asks every signed-in vendor at once.
 func fetchSubscriptionUsage() []SubscriptionQuota {
-	ctx, cancel := context.WithTimeout(context.Background(), subscriptionTimeout)
+	ctx0, cancel := context.WithTimeout(context.Background(), subscriptionTimeout)
 	defer cancel()
+	// each account asked through its own proxy, if it has one (#237)
+	proxies := map[string]string{}
+	for _, p := range load().Providers {
+		proxies[p.ID] = p.Proxy
+	}
+	via := func(id string) context.Context { return netproxy.With(ctx0, proxies[id]) }
+	// and one account of several through its own, if it has one (perLogin
+	// and loginQuota ask each so)
+	viaLogin := func(id, user string) context.Context { return ViaLogin(ctx0, id, user) }
 	hidden := map[string]bool{}
 	for _, p := range load().Providers {
 		hidden[p.ID] = p.Hidden || p.Off // switched off: not asked either
 	}
 	var fetches []func() SubscriptionQuota
+	// a built-in moved onto its plugin shows the plugin's cards in its
+	// place, and none of its own: an agent's own sign-in it still finds
+	// would be a second card of the same account
+	placed := map[string]bool{}
+	moved := func(id string) bool {
+		if !Moved(id) {
+			return false
+		}
+		placed[id] = true
+		if !hidden[id] {
+			fetches = append(fetches, pluginUsageFetchesOf(via, id)...)
+		}
+		return true
+	}
 	if p, ok := claudeAccount(); ok && !hidden["claude"] {
 		if ls := accountsOf("claude"); len(ls) > 1 {
-			fetches = append(fetches, perLogin(ctx, ls, "Claude Code", "claude-color")...)
+			fetches = append(fetches, perLogin(via("claude"), ls, "Claude Code", "claude-color")...)
 		} else {
-			fetches = append(fetches, withUser(p.Account.User, func() SubscriptionQuota { return claudeSubscriptionUsage(ctx) }))
+			fetches = append(fetches, withUser(p.Account.User, func() SubscriptionQuota { return claudeSubscriptionUsage(viaLogin("claude", p.Account.User)) }))
 		}
 	}
-	if user, plan, ok := cursorIdentity(); ok && !hidden["cursor"] {
-		fetches = append(fetches, withUser(user, func() SubscriptionQuota { return cursorSubscriptionUsage(ctx, plan) }))
+	if user, plan, ok := cursorIdentity(); !moved("cursor") && ok && !hidden["cursor"] {
+		fetches = append(fetches, withUser(user, func() SubscriptionQuota { return cursorSubscriptionUsage(viaLogin("cursor", user), plan) }))
 	}
-	if _, ok := grokAccount(); ok && !hidden["grok"] {
-		fetches = append(fetches, func() SubscriptionQuota { return grokSubscriptionUsage(ctx) })
+	if _, ok := grokAccount(); !moved("grok") && ok && !hidden["grok"] {
+		fetches = append(fetches, func() SubscriptionQuota { return grokSubscriptionUsage(via("grok")) })
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		if p, ok := codexAccount(home); ok && !hidden["codex"] {
 			if ls := accountsOf("codex"); len(ls) > 1 {
-				fetches = append(fetches, perLogin(ctx, ls, "Codex", "codex-color")...)
+				fetches = append(fetches, perLogin(via("codex"), ls, "Codex", "codex-color")...)
 			} else {
 				auth := filepath.Join(home, ".codex", "auth.json")
-				fetches = append(fetches, withUser(p.Account.User, func() SubscriptionQuota { return codexSubscriptionUsage(ctx, auth) }))
+				fetches = append(fetches, withUser(p.Account.User, func() SubscriptionQuota { return codexSubscriptionUsage(viaLogin("codex", p.Account.User), auth) }))
 			}
 		}
-		cfg := os.Getenv("XDG_CONFIG_HOME")
-		if cfg == "" {
-			cfg = filepath.Join(home, ".config")
-		}
-		if app, ok := copilotLogin(cfg); ok && !hidden["copilot"] {
-			if ls := copilotLoginList(); len(ls) > 1 {
-				fetches = append(fetches, perLogin(ctx, ls, "Copilot", "githubcopilot")...)
-			} else {
-				fetches = append(fetches, withUser(app.User, func() SubscriptionQuota { return copilotSubscriptionUsage(ctx, app.Token) }))
-			}
+		// Every Copilot account magpie knows, the editors' or the CLI's own
+		// sign-in or not: one signed in from magpie alone is enough
+		// (copilotLoginList reads both, copilot_accounts.go). Asking only
+		// when copilotLogin found the editors' token left an account magpie
+		// signed in itself without a card on the Usage page, and out of the
+		// gateway's GET /v1/magpie/quotas, however fresh its reading was
+		// (subscription_usage_test.go, TestCopilotQuotaWithoutEditorsSignIn).
+		if ls := copilotLoginList(); len(ls) > 0 && !hidden["copilot"] {
+			fetches = append(fetches, perLogin(via("copilot"), ls, "Copilot", "githubcopilot")...)
 		}
 	}
-	if key := kiroKey(); key != "" && !hidden["kiro"] {
-		fetches = append(fetches, func() SubscriptionQuota { return kiroQuotaAt(ctx, key, "") })
+	if moved("kiro") {
+	} else if key := kiroKey(); key != "" && !hidden["kiro"] {
+		fetches = append(fetches, func() SubscriptionQuota { return kiroQuotaAt(via("kiro"), key, "") })
 	} else if !hidden["kiro"] {
-		fetches = append(fetches, perLogin(ctx, kiroLoginList(), "Kiro", "kiro-color")...)
+		fetches = append(fetches, perLogin(via("kiro"), kiroLoginList(), "Kiro", "kiro-color")...)
 	}
-	if !hidden["zcode"] {
-		fetches = append(fetches, perLogin(ctx, zcodeLoginList(), "ZCode", "zcode")...)
+	if !moved("zcode") && !hidden["zcode"] {
+		fetches = append(fetches, perLogin(via("zcode"), zcodeLoginList(), "ZCode", "zcode")...)
 	}
 	for _, w := range []*wbSite{wbCN, wbAI} {
-		if !hidden[w.id] {
-			fetches = append(fetches, perLogin(ctx, wbLoginList(w), w.name, "workbuddy-color")...)
+		if !moved(w.id) && !hidden[w.id] {
+			fetches = append(fetches, perLogin(via(w.id), wbLoginList(w), w.name, "workbuddy-color")...)
 		}
 	}
-	if !hidden[CommandCodePlanID] {
-		fetches = append(fetches, perLogin(ctx, cmdLoginList(), "Command Code", "commandcode")...)
+	if !moved(CommandCodePlanID) && !hidden[CommandCodePlanID] {
+		fetches = append(fetches, perLogin(via(CommandCodePlanID), cmdLoginList(), "Command Code", "commandcode")...)
 	}
-	if !hidden["qoder"] {
-		fetches = append(fetches, perLogin(ctx, loginsOf(qoderLogins()), "Qoder", "qoder")...)
+	if !moved("qoder") && !hidden["qoder"] {
+		fetches = append(fetches, perLogin(via("qoder"), loginsOf(qoderLogins()), "Qoder", "qoder")...)
+	}
+	if !moved(QoderCNID) && !hidden[QoderCNID] {
+		fetches = append(fetches, perLogin(via(QoderCNID), loginsOf(qoderLoginsOf(QoderCNID)), "Qoder CN", "qoder")...)
+	}
+	if !moved("zed") && !hidden["zed"] {
+		fetches = append(fetches, perLogin(via("zed"), zedLoginList(), "Zed", "zed")...)
+	}
+	if !moved("devin") && !hidden["devin"] {
+		fetches = append(fetches, perLogin(via("devin"), devinLoginList(), "Devin", "devin")...)
+	}
+	if !moved("factory") && !hidden["factory"] {
+		fetches = append(fetches, perLogin(via("factory"), factoryLoginList(), "Factory", "factory")...)
+	}
+	if !moved(MiMoID) && !hidden[MiMoID] {
+		fetches = append(fetches, perLogin(via(MiMoID), mimoLoginList(), "Xiaomi MiMo", "mimocode")...)
 	}
 	for _, agent := range []string{"gemini", "antigravity"} {
 		if hidden[agent] {
 			continue
 		}
 		for _, l := range googleLogins(agent) {
-			fetches = append(fetches, func() SubscriptionQuota { return l.acct.quota(ctx, l.Plan) })
+			fetches = append(fetches, func() SubscriptionQuota { return l.acct.quota(viaLogin(agent, l.User), l.Plan) })
 		}
 	}
+	fetches = append(fetches, pluginUsageFetches(via, hidden, placed)...)
 	out := make([]SubscriptionQuota, len(fetches))
 	var wg sync.WaitGroup
 	for i, f := range fetches {
@@ -327,74 +382,115 @@ func (e *accountStatusError) Error() string { return http.StatusText(e.status) }
 
 func claudeSubscriptionUsage(ctx context.Context) SubscriptionQuota {
 	q := SubscriptionQuota{Provider: "claude", Name: "Claude Code", Icon: "claude-color", Windows: []QuotaWindow{}}
-	token, err := claudeToken(ctx)
-	if err != nil {
-		q.Error = err.Error()
+	if _, _, ok := claudeCredential(); !ok {
+		q.Error = "Claude Code is signed out; run claude auth login"
 		return q
 	}
 	user, plan, _ := claudeIdentity()
 	q.Plan = plan
-	q.Windows, err = claudeWindows(ctx, user, token)
+	var err error
+	q.Windows, err = claudeWindows(ctx, user, true)
 	if err != nil {
 		q.Error = err.Error()
 	}
 	return q
 }
 
-// claudeUsage keeps each Claude account's allowance as last read, by user.
-// Anthropic's usage endpoint turns away an account asked more than a few
-// times in a while (429, rate_limit_error), and the Usage page, the switch
-// list and routing all ask for it: they share what was read in the last
-// few minutes, and one turned away waits as long as it is told, or five
-// minutes, showing what was known until then.
+// claudeUsage keeps each Claude account's allowance as Claude Code last
+// told it: its /usage, run when the user asks (AskClaudeUsage) and only for
+// the account it is signed in to, or what it said as it answered
+// (NoteClaudeLimits). magpie never asks Anthropic for it itself; the Usage
+// page's timer, the switch list and routing show what is kept here.
 var claudeUsage struct {
 	sync.Mutex
 	m map[string]claudeUsageEntry
 }
 
 type claudeUsageEntry struct {
-	at, retry time.Time
-	ws        []QuotaWindow
-	heard     time.Time // when Claude Code last told it, answering
+	at    time.Time
+	ws    []QuotaWindow
+	heard time.Time // when Claude Code last told it, answering
+	tried time.Time // when /usage was last run, answered or not
+	err   error     // what the last run said, when it failed
 }
 
-const claudeUsageTTL = 3 * time.Minute
+// claudeAskFloor is the least time between two readings, however often the
+// user refreshes; claudeEvery, between two that nobody asked for (a
+// reading magpie keeps up to date by itself, for the Usage page left open,
+// the menu bar's figures and routing).
+const (
+	claudeAskFloor = 30 * time.Second
+	claudeEvery    = 10 * time.Minute
+)
 
-// claudeWindows is the allowance of the Claude account user, token signs
-// in to.
-func claudeWindows(ctx context.Context, user, token string) ([]QuotaWindow, error) {
+// claudeAsked is when the user last asked to see Claude's usage (unix
+// nanoseconds; zero: never).
+var claudeAsked atomic.Int64
+
+// AskClaudeUsage is the user asking to see Claude's usage — opening the
+// Usage page, refreshing it, `magpie quota` — so Claude Code's /usage is
+// run at once rather than when the last reading is claudeEvery old; the
+// next SubscriptionUsage waits for it.
+func AskClaudeUsage() {
+	claudeAsked.Store(time.Now().UnixNano())
+	c := &subscriptionUsageCache
+	c.Lock()
+	c.at, c.asked = time.Time{}, true
+	c.Unlock()
+	l := &loginUsageCache
+	l.Lock()
+	for k := range l.m {
+		if strings.HasPrefix(k, "claude/") {
+			delete(l.m, k)
+		}
+	}
+	l.Unlock()
+}
+
+// claudeWindows is the allowance of the Claude account user. Only the
+// account Claude Code is signed in to (active) is read, by Claude Code's
+// own /usage: when the user asked since it last was, or when the last
+// reading is claudeEvery old; any other time it is what was kept.
+// magpie itself never asks Anthropic.
+func claudeWindows(ctx context.Context, user string, active bool) ([]QuotaWindow, error) {
 	key := strings.ToLower(user)
 	c := &claudeUsage
+	now := time.Now()
+	asked := claudeAsked.Load()
 	c.Lock()
 	e, ok := c.m[key]
-	c.Unlock()
-	now := time.Now()
-	if ok && e.ws != nil && (now.Sub(e.at) < claudeUsageTTL || now.Before(e.retry)) {
-		return elapsed(e.ws, now), nil
-	}
-	if ok && now.Before(e.retry) {
-		return []QuotaWindow{}, claudeLimited(e.retry.Sub(now))
-	}
-	ws, err := readClaudeWindows(ctx, token)
-	var st *accountStatusError
-	if errors.As(err, &st) && st.status == http.StatusTooManyRequests {
-		wait := st.retryAfter
-		if wait <= 0 {
-			wait = 5 * time.Minute
-		}
-		c.Lock()
+	// one reading an ask or a claudeEvery, its first caller's; the others
+	// keep to it
+	due := e.tried.IsZero() || now.Sub(e.tried) >= claudeEvery || asked > e.tried.UnixNano()
+	read := active && due && now.Sub(e.tried) >= claudeAskFloor
+	if read {
 		if c.m == nil {
 			c.m = map[string]claudeUsageEntry{}
 		}
-		e.retry = now.Add(wait)
+		e.tried = now
 		c.m[key] = e
-		c.Unlock()
-		if e.ws != nil {
-			return elapsed(e.ws, now), nil
-		}
-		return []QuotaWindow{}, claudeLimited(wait)
 	}
+	c.Unlock()
+	if !read {
+		switch {
+		case ok && e.ws != nil:
+			return elapsed(e.ws, now), nil
+		case ok && e.err != nil:
+			return []QuotaWindow{}, e.err
+		case active:
+			return []QuotaWindow{}, errClaudeNotAsked
+		default:
+			return []QuotaWindow{}, errClaudeSaved
+		}
+	}
+	ws, err := readClaudeUsage(ctx)
 	if err != nil {
+		c.Lock()
+		if f, ok := c.m[key]; ok && f.tried.Equal(now) {
+			f.err = err
+			c.m[key] = f
+		}
+		c.Unlock()
 		if e.ws != nil && now.Sub(e.heard) < claudeHeard {
 			return elapsed(e.ws, now), nil // what Claude Code said stands
 		}
@@ -404,15 +500,15 @@ func claudeWindows(ctx context.Context, user, token string) ([]QuotaWindow, erro
 	if c.m == nil {
 		c.m = map[string]claudeUsageEntry{}
 	}
-	c.m[key] = claudeUsageEntry{at: now, ws: ws, heard: e.heard}
+	c.m[key] = claudeUsageEntry{at: now, ws: ws, heard: e.heard, tried: now}
 	c.Unlock()
 	return ws, nil
 }
 
-// claudeLimited is Anthropic turning the usage endpoint away for wait.
-func claudeLimited(wait time.Duration) error {
-	return fmt.Errorf("Anthropic is rate limiting its usage endpoint; magpie asks again in %s", wait.Round(time.Minute).String())
-}
+var (
+	errClaudeNotAsked = errors.New("not read yet: magpie reads Claude's usage by running Claude Code's /usage")
+	errClaudeSaved    = errors.New("magpie doesn't read a saved account's usage; it shows what Claude Code reports while using it")
+)
 
 // elapsed is ws as of now: a window that has reset since it was read
 // starts again from nothing.
@@ -425,63 +521,6 @@ func elapsed(ws []QuotaWindow, now time.Time) []QuotaWindow {
 		out[i] = w
 	}
 	return out
-}
-
-// readClaudeWindows asks Anthropic for the allowance of the account token
-// signs in to.
-func readClaudeWindows(ctx context.Context, token string) ([]QuotaWindow, error) {
-	var data struct {
-		FiveHour       *quotaWire `json:"five_hour"`
-		SevenDay       *quotaWire `json:"seven_day"`
-		SevenDayOpus   *quotaWire `json:"seven_day_opus"`
-		SevenDaySonnet *quotaWire `json:"seven_day_sonnet"`
-		// a week's allowance per model (Fable), which the fields above
-		// don't carry; one with no scope is seven_day again
-		Limits []struct {
-			Kind     string   `json:"kind"`
-			Percent  *float64 `json:"percent"`
-			ResetsAt string   `json:"resets_at"`
-			Scope    *struct {
-				Model *struct {
-					DisplayName string `json:"display_name"`
-				} `json:"model"`
-			} `json:"scope"`
-		} `json:"limits"`
-	}
-	err := accountJSON(ctx, claudeBase+"/api/oauth/usage", token, map[string]string{
-		"anthropic-beta": "oauth-2025-04-20", "user-agent": "magpie",
-	}, &data)
-	if err != nil {
-		return []QuotaWindow{}, err
-	}
-	out := []QuotaWindow{}
-	const week = 7 * 24 * time.Hour
-	for _, x := range []struct {
-		name, model string
-		span        time.Duration
-		w           *quotaWire
-	}{{"5 hours", "", 5 * time.Hour, data.FiveHour}, {"7 days", "", week, data.SevenDay},
-		{"7 days · Opus", "opus", week, data.SevenDayOpus}, {"7 days · Sonnet", "sonnet", week, data.SevenDaySonnet}} {
-		if x.w != nil {
-			w := x.w.window(x.name)
-			w.Span, w.Model = x.span, x.model
-			out = append(out, w)
-		}
-	}
-	for _, l := range data.Limits {
-		if l.Kind != "weekly_scoped" || l.Scope == nil || l.Scope.Model == nil || l.Percent == nil {
-			continue
-		}
-		name := strings.TrimSpace(l.Scope.Model.DisplayName)
-		model := claudeScopeModel(name)
-		if model == "" || slices.ContainsFunc(out, func(w QuotaWindow) bool { return w.Model == model }) {
-			continue
-		}
-		w := quotaWire{Utilization: *l.Percent, ResetsAt: l.ResetsAt}.window("7 days · " + name)
-		w.Span, w.Model = week, model
-		out = append(out, w)
-	}
-	return out, nil
 }
 
 // claudeScopeModel is the word a model-scoped window counts models by, from

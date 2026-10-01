@@ -8,11 +8,14 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
+	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/sessions"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -35,6 +38,7 @@ type sessionsJSON struct {
 }
 
 func sessionRoutes(mux *http.ServeMux, w Windows) {
+	warmSessions()
 	mux.HandleFunc("GET /api/sessions", func(rw http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		agents := map[string]*agent.Agent{}
@@ -69,7 +73,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 	// page to filter; names are the agents' as the page shows them.
 	mux.HandleFunc("GET /api/sessions/stats", func(rw http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.URL.Query().Get("days"))
-		st := sessions.StatsFor(max(0, n))
+		st := statsFor(n)
 		names := map[string]string{}
 		for _, a := range agent.Clients() {
 			names[a.ID] = a.Name
@@ -88,6 +92,43 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			Agents map[string]string `json:"agents"`
 		}{st, agents})
 	})
+	// overview sums up the range's sessions under the page's filters:
+	// how many, what the middle one spent, how many each day, and the ones
+	// that spent the most.
+	mux.HandleFunc("GET /api/sessions/overview", func(rw http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		n, _ := strconv.Atoi(q.Get("days"))
+		writeJSON(rw, statsFor(n).Overview(q.Get("agent"), q.Get("model"), q.Get("cwd"), 8))
+	})
+	// progress is how far the reading of the session files has got, for
+	// the page to show while its first read takes a while.
+	mux.HandleFunc("GET /api/sessions/progress", func(rw http.ResponseWriter, r *http.Request) {
+		writeJSON(rw, sessions.Indexing())
+	})
+	// one is a session by its stats key, read however long ago it was at
+	// work: the page's top sessions reach past the latest List reads.
+	mux.HandleFunc("GET /api/sessions/one", func(rw http.ResponseWriter, r *http.Request) {
+		s, ok := sessions.Get(r.URL.Query().Get("key"))
+		if !ok {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(rw).Encode(map[string]string{"error": "no such session"})
+			return
+		}
+		j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic"}
+		for _, a := range agent.Clients() {
+			if a.ID == s.Agent {
+				j.Name, j.Icon = a.Name, a.Icon
+			}
+		}
+		since := s.Start
+		if since.IsZero() {
+			since = s.Last
+		}
+		j.Via = usage.Vias(since.Add(-time.Minute))[s.Agent+"|"+s.ID]
+		j.Path = tilde(j.Path)
+		writeJSON(rw, j)
+	})
 	// terminal opens Terminal on a session's resume command. The command is
 	// made here from the session as listed, never taken from the page.
 	mux.HandleFunc("POST /api/sessions/terminal", func(rw http.ResponseWriter, r *http.Request) {
@@ -105,7 +146,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, errors.New("no such session"))
 			return
 		}
-		if err := openTerminal(s.Resume); err != nil {
+		if err := openTerminal(s.Resume, settings.Load().SessionTerminal); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -113,10 +154,80 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 	})
 }
 
-// openTerminal runs a command in a new Terminal window, through a .command
-// file Terminal opens as it would a double-click: no Automation consent.
+// statsFor is sessions.StatsFor for a range, kept: the page asks for the
+// stats and the overview one after the other, and for the same range again
+// each time it is shown. What was read is answered at once; when it is more
+// than a few seconds old it is read again behind, for the next ask.
+var statsMemo struct {
+	sync.Mutex
+	m map[int]*statsKept
+}
+
+type statsKept struct {
+	at   time.Time
+	st   sessions.Stats
+	busy bool
+}
+
+func statsFor(days int) sessions.Stats {
+	days = max(0, days)
+	statsMemo.Lock()
+	if k := statsMemo.m[days]; k != nil {
+		if !k.busy && time.Since(k.at) > 10*time.Second {
+			k.busy = true
+			go func() {
+				st := sessions.StatsFor(days)
+				statsMemo.Lock()
+				k.at, k.st, k.busy = time.Now(), st, false
+				statsMemo.Unlock()
+			}()
+		}
+		st := k.st
+		statsMemo.Unlock()
+		return st
+	}
+	statsMemo.Unlock()
+	st := sessions.StatsFor(days)
+	statsMemo.Lock()
+	if statsMemo.m == nil {
+		statsMemo.m = map[int]*statsKept{}
+	}
+	if statsMemo.m[days] == nil {
+		statsMemo.m[days] = &statsKept{at: time.Now(), st: st}
+	}
+	statsMemo.Unlock()
+	return st
+}
+
+// warmSessions reads every session file once magpie is up, so the Sessions
+// page opens on the kept index and not on a first read of them all.
+func warmSessions() {
+	if testing.Testing() {
+		return
+	}
+	go func() {
+		time.Sleep(3 * time.Second)
+		statsFor(0)
+		statsFor(30)
+	}()
+}
+
+// openTerminal runs a command in the chosen Mac terminal through a .command
+// file, as it would open from Finder: no Automation consent.
 // The shell is left open when the agent quits.
-func openTerminal(command string) error {
+func openTerminal(command, choice string) error {
+	var found terminalDiscovery
+	if choice != terminalBundleID {
+		var err error
+		// the system default falls back to Terminal when nothing is found
+		if found, err = discoverTerminals(); err != nil && choice != "" && choice != "system" {
+			return err
+		}
+	}
+	args, err := terminalOpenArgs(choice, found)
+	if err != nil {
+		return err
+	}
 	f, err := os.CreateTemp("", "magpie-resume-*.command")
 	if err != nil {
 		return err
@@ -133,7 +244,8 @@ func openTerminal(command string) error {
 		os.Remove(f.Name())
 		return err
 	}
-	if err := proc.Command("open", "-a", "Terminal", f.Name()).Run(); err != nil {
+	args = append(args, f.Name())
+	if err := proc.Command("open", args...).Run(); err != nil {
 		os.Remove(f.Name())
 		return err
 	}

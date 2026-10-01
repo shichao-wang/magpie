@@ -10,13 +10,17 @@ package settings
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/redact"
 )
 
@@ -25,6 +29,9 @@ type Settings struct {
 	Theme string `json:"theme,omitempty"` // system | light | dark
 	Lang  string `json:"lang,omitempty"`  // system | en | zh
 	Tray  string `json:"tray,omitempty"`  // what clicking the tray icon opens: panel | window
+	// SessionTerminal is the Mac app that opens a resumed session, by bundle
+	// id. "" and "system" follow the .command file association.
+	SessionTerminal string `json:"sessionTerminal,omitempty"`
 	// Currency is what a cost — the Usage page's, the tray panel's, the
 	// TUI's and the CLI's — is shown converted to: usd (its native
 	// currency, list prices being in dollars) or cny, at a live exchange
@@ -58,6 +65,10 @@ type Settings struct {
 	// key magpie makes when LAN is first turned on.
 	LAN    bool   `json:"lan,omitempty"`
 	LANKey string `json:"lanKey,omitempty"`
+	// RequestArchive keeps each call the gateway serves — its headers and
+	// bodies both ways, secrets taken out — in the S3 bucket sync keeps
+	// its backup in (gateway/archive.go), for looking into a request later.
+	RequestArchive bool `json:"requestArchive,omitempty"`
 	// CodexWarmup starts a ChatGPT account's next window as soon as the
 	// last one resets, with one tiny request, so it counts from then (a
 	// Codex window starts at its first use): "" off, "week" the weekly
@@ -74,6 +85,11 @@ type Settings struct {
 	// with CodexWarmup or without it. ClaudeWarmAt is the Claude accounts'.
 	CodexWarmAt  string `json:"codexWarmAt,omitempty"`
 	ClaudeWarmAt string `json:"claudeWarmAt,omitempty"`
+	// CodexAutoReset are the ChatGPT accounts (lower-case) that spend one
+	// of their rate-limit resets by themselves once their weekly window is
+	// used up and no other account can take the request: at most one a
+	// week each (see provider.AutoUseCodexReset).
+	CodexAutoReset []string `json:"codexAutoReset,omitempty"`
 	// WorkBuddyCheckin presses WorkBuddy's daily check-in (签到) for each
 	// signed-in WorkBuddy (China) account once a Beijing day, claiming the
 	// credits it gives while its event runs.
@@ -81,6 +97,12 @@ type Settings struct {
 	// NoStats stops the one event a day that counts magpie's users (see
 	// internal/stats).
 	NoStats bool `json:"noStats,omitempty"`
+	// NoUpdatePill keeps the header's Update pill away when a newer magpie
+	// is out; UpdateSkip is the one version it was hidden for, and a newer
+	// one brings it back. Either way magpie still downloads the version and
+	// puts it in as it quits, and Settings' version row still offers it.
+	NoUpdatePill bool   `json:"noUpdatePill,omitempty"`
+	UpdateSkip   string `json:"updateSkip,omitempty"`
 	// Vision is the model that describes an image to a model that can't see
 	// it: a model's id (provider/model, group/<id>), "off" to turn such an
 	// image away, or empty for one magpie picks (see gateway.seer).
@@ -88,16 +110,45 @@ type Settings struct {
 	// ImageGen is the model magpie's generate_image tool draws with (the
 	// gateway's /v1/images/generations when a request names no model): a
 	// model's id, "off", or empty for one magpie picks (gateway.drawer).
+	// "off" turns the video a request that names no model gets off too
+	// (gateway.videomaker).
 	ImageGen string `json:"imageGen,omitempty"`
-	// TrayUsage is the subscription or plan whose windows are shown beside
-	// the tray icon, by its provider and account ("claude|a@b.c"); "" none.
+	// TrayUsages are the subscriptions and plans whose windows are shown
+	// beside the tray icon, in the order shown, each by its provider and
+	// account ("claude|a@b.c"); none when empty.
+	TrayUsages []string `json:"trayUsages,omitempty"`
+	// TrayUsage is TrayUsages' first, all a magpie before them read: a file
+	// with it and no TrayUsages shows that one, and it is kept written for
+	// an older magpie to go on showing it.
 	TrayUsage string `json:"trayUsage,omitempty"`
 	// TrayUsageEvery is how often, in minutes, that text is brought up to
 	// date; 0 is every 3 (one of TrayEvery).
 	TrayUsageEvery int `json:"trayUsageEvery,omitempty"`
+	// TrayNoLogos draws the Mac menu bar's cards without their logos: each
+	// is its windows stacked alone, a thin line between one card and the
+	// next.
+	TrayNoLogos bool `json:"trayNoLogos,omitempty"`
 	// QuotaLeft shows a subscription's windows by how much of each is left,
 	// not used: the Usage page, the tray panel and the menu bar alike.
 	QuotaLeft bool `json:"quotaLeft,omitempty"`
+	// UsageAlert is how much of a subscription's or plan's window, in
+	// percent, is used when magpie says so with a notification (#368):
+	// once for each time the window runs, for every window routing counts
+	// (not one set aside, as on-demand spending is); 0 is off.
+	UsageAlert int `json:"usageAlert,omitempty"`
+	// BalanceAlert is the balance a key or account has fallen to when
+	// magpie says so, in that balance's own currency or credits, once until
+	// it is topped up past it again; 0 is off.
+	BalanceAlert float64 `json:"balanceAlert,omitempty"`
+	// PlainNames has the model lists magpie gives agents name each model
+	// by its name alone, without its provider's or "routing group" after it
+	// (#335) — but for two in one list that would read the same, which keep
+	// it (see provider.Labels).
+	PlainNames bool `json:"plainNames,omitempty"`
+	// TextSize is how large the window's and the tray panel's pages are
+	// drawn, in percent (one of TextSizes): the webviews' own zoom, as a
+	// browser's, so the text and everything around it grow together.
+	TextSize int `json:"textSize,omitempty"`
 	// How the agents are listed, by agent id. AgentOrder comes first, as
 	// ordered; an agent it doesn't name (one installed since) follows in
 	// magpie's own order. A hidden agent is folded away at the bottom of the
@@ -110,6 +161,22 @@ type Settings struct {
 	// families (the tag a provider or group is given), provider ids and
 	// group ids its lists hold. An agent it doesn't name is shown them all.
 	Visible map[string][]string `json:"visible,omitempty"`
+	// HiddenModels are the catalog entries (their ids, "<provider>/<model>"
+	// or a group's) taken out of an agent's lists one by one, by agent id,
+	// after Visible: a model not named here, a new one among them, is shown.
+	HiddenModels map[string][]string `json:"hiddenModels,omitempty"`
+
+	// The three maps below, and every one added beside them, are the
+	// per-model ones: a field named Model* whose type is a map[string]X,
+	// keyed "<provider id>/<model id>" (or "<provider id>/*", for all of
+	// that provider's models — CheckModelKey). That is the whole of the
+	// convention, and it is what RenamePerModel and the GUI's saving of
+	// the settings go by, each of them walking the fields by it rather
+	// than by a list kept up to date by hand: a map added here later is
+	// moved when a provider is renamed and kept when another page saves
+	// the settings, with no line written for it in either place. A field
+	// whose keys are not a model's is not one of these, and is not named
+	// Model* — Visible, which is by agent id, among them.
 	// ModelNames are the names the user gave models, by "<provider
 	// id>/<model id>": agents, the gateway's model list and magpie itself
 	// show them for the vendor's (see provider.SetModelName).
@@ -118,9 +185,95 @@ type Settings struct {
 	// by "<provider id>/<model id>": the lists magpie hands out offer only
 	// those (see provider.SetModelEfforts).
 	ModelEfforts map[string][]string `json:"modelEfforts,omitempty"`
+	// ModelImages is whether the user said a model takes images, by
+	// "<provider id>/<model id>". Absent leaves it to the vendor's list.
+	ModelImages map[string]bool `json:"modelImages,omitempty"`
+	// ModelPrices is what a model costs the user, in USD per million
+	// tokens, by "<provider id>/<model id>", and "*" for every model of
+	// that provider: a provider models.dev does not list, or one that
+	// resells at a multiplier, is otherwise priced at whatever its maker's
+	// list price is.
+	ModelPrices map[string]ModelPrice `json:"modelPrices,omitempty"`
+	// ModelOutputs is the most a reply of a model may hold, by "<provider
+	// id>/<model id>", and "*" for every model of that provider. Absent
+	// leaves it to the vendor's own list and to models.dev, as a context
+	// the user has not set is. A model's own value wins over its
+	// provider's, and the agents' own files are told of either
+	// (see provider.SetModelOutput).
+	ModelOutputs map[string]int `json:"modelOutputs,omitempty"`
+	// ModelWires is the name to send a vendor for a model magpie knows by
+	// another, by "<provider id>/<model id>", and "*" for every model of that
+	// provider. A "*" in the name is the model itself, so one name covers a
+	// relay that namespaces its models — vendor-c/* asks for model-3 as
+	// vendor-c/model-3 — while a name with no "*" in it sends every model of
+	// that key under that one name. Everything else — the catalog agents see,
+	// the routing groups, the usage records and what a call is priced at —
+	// keeps the name magpie knows the model by.
+	ModelWires map[string]string `json:"modelWires,omitempty"`
 	// The main window's size when it was last resized, width and height,
 	// so it opens at it again after a restart.
 	Window []int `json:"window,omitempty"`
+}
+
+// ModelPrice is the price of one model as the user states it. Each part is a
+// pointer so that a file leaving one out is told so rather than billing that
+// part of the call at zero: a model is priced whole or not at all.
+type ModelPrice struct {
+	Input      *float64 `json:"input,omitempty"`
+	Output     *float64 `json:"output,omitempty"`
+	CacheRead  *float64 `json:"cache_read,omitempty"`
+	CacheWrite *float64 `json:"cache_write,omitempty"`
+}
+
+// priceParts are the parts of a price, in the order they are asked for and
+// in the order ModelPrice holds them, named as a message about one says
+// them: "cache read" and "cache write", the words the CLI and the README
+// use, not the cache_read and cache_write of the file's own keys, which
+// are the disk format and stay as they are.
+var priceParts = [...]string{"input", "output", "cache read", "cache write"}
+
+// Price is the price the user stated, when every part of it is given and is a
+// number a vendor could charge. The second return names the first part that is
+// not, empty when the price is usable.
+func (m ModelPrice) Price() (catalog.Price, string) {
+	parts := []*float64{m.Input, m.Output, m.CacheRead, m.CacheWrite}
+	for i, v := range parts {
+		if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) || *v < 0 {
+			return catalog.Price{}, priceParts[i]
+		}
+	}
+	return catalog.Price{
+		Input: *m.Input, Output: *m.Output,
+		CacheRead: *m.CacheRead, CacheWrite: *m.CacheWrite,
+	}, ""
+}
+
+// CheckModelPrice is whether a price the user gives is one magpie will bill a
+// call at: the key names a model the way the per-model maps key one, and
+// every part of the price is a number a vendor could charge, naming the first
+// that is not. It is where a price is checked rather than in Save: one a hand
+// edit left broken in the file is skipped where it is read, and must not stop
+// an unrelated setting from being saved. That covers a part that is missing,
+// which is what a file can be edited into: JSON has no NaN or Infinity, and
+// Load discards the whole file rather than half of it, so neither reaches
+// here. Both are still refused, from a price typed in or passed in.
+func CheckModelPrice(key string, m ModelPrice) error {
+	if err := CheckModelKey("price", key); err != nil {
+		return err
+	}
+	if _, bad := m.Price(); bad != "" {
+		return fmt.Errorf("the price of %q needs %s %s price that is present, finite and not negative", key, anArticle(bad), bad)
+	}
+	return nil
+}
+
+// anArticle is the article a word takes where a message names it, so that an
+// input price is not "a input price".
+func anArticle(word string) string {
+	if strings.ContainsRune("aeiou", rune(word[0])) {
+		return "an"
+	}
+	return "a"
 }
 
 // Arrange puts items in the order the user gave the agents, those named
@@ -167,7 +320,116 @@ var (
 	Warmups = []string{"", "week", "all"}
 	// TrayEvery are TrayUsageEvery's values, in minutes.
 	TrayEvery = []int{1, 3, 5, 10, 30}
+	// TextSizes are TextSize's values, in percent. None is under 100: the
+	// webviews' zoom on Windows and Linux (Wails' SetZoom) goes no lower.
+	TextSizes = []int{100, 110, 125, 150}
 )
+
+var validTerminalBundleID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$`)
+
+// providerID is how a provider's id is spelled: lower-case letters, digits
+// and dashes, as provider.Slug derives it (a custom provider's id is the
+// same, the site it is on when its name has none).
+var providerID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// CheckModelKey is whether a key of one of the per-model maps names a model
+// the way all of them do: "<provider id>/<model id>" — or "<provider id>/*"
+// for all of that provider's models. A model id may have slashes of its own
+// (vendor/model), so only the first one ends the provider's id. what names
+// the setting being checked, for the error.
+//
+// It is the one rule a model key is held to, and it lives here, beside the
+// maps it keys. Every change that takes such a key from the user checks it
+// here rather than spelling the shape out again, so what is written into a
+// map and what is refused come out of the same rule — one rule, and not one
+// each branch can drift from on its own.
+func CheckModelKey(what, key string) error {
+	pid, model, ok := strings.Cut(key, "/")
+	if !ok || model == "" {
+		return fmt.Errorf("%s must be a model as <provider>/<model>, such as openai/gpt-5-mini, or <provider>/*, not %q", what, key)
+	}
+	if !providerID.MatchString(pid) {
+		return fmt.Errorf("%s must name a provider before the model's id, such as openai/gpt-5-mini, not %q", what, key)
+	}
+	return nil
+}
+
+// perModelFields are the fields of t that are per-model: those named Model*
+// whose type is a map[string]X (see ModelNames). The name and the type are
+// all that is looked at, so a field the caller means by another key is taken
+// for a per-model map all the same, and a field of a type that is not
+// map[string]X is left out however it is named.
+func perModelFields(t reflect.Type) []reflect.StructField {
+	var out []reflect.StructField
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if strings.HasPrefix(f.Name, "Model") && f.Type.Kind() == reflect.Map && f.Type.Key().Kind() == reflect.String {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// PerModelKeys calls fn with the name of every per-model map of s and the
+// map itself, the settings' own values and not copies, so fn may change them
+// (see ModelNames). A field that is not per-model is not passed; the name
+// comes with the map so a caller that reports on the maps it was given can
+// tell them apart.
+func PerModelKeys(s *Settings, fn func(name string, m reflect.Value)) {
+	v := reflect.ValueOf(s).Elem()
+	for _, f := range perModelFields(v.Type()) {
+		fn(f.Name, v.FieldByIndex(f.Index))
+	}
+}
+
+// CarryPerModel puts cur's per-model maps into in's, whole as they are: the
+// ones a page that sends only its own choices would otherwise save as
+// nothing, and so lose. Every per-model map is carried, whichever page wrote
+// it, so a map added to the settings later needs nothing said of it here.
+func CarryPerModel(in, cur *Settings) {
+	dst, src := reflect.ValueOf(in).Elem(), reflect.ValueOf(cur).Elem()
+	for _, f := range perModelFields(dst.Type()) {
+		dst.FieldByIndex(f.Index).Set(src.FieldByIndex(f.Index))
+	}
+}
+
+// RenamePerModel moves what the user said of a provider's models to the id
+// it has now: in every per-model map (see ModelNames) each key beginning
+// with from+"/" is rewritten to to+"/", and it says whether any key moved at
+// all. A provider that changes its id keeps the names, levels, image
+// answers and everything else given to its models, each map moved whether or
+// not the ones before it moved anything.
+func (s *Settings) RenamePerModel(from, to string) bool {
+	moved := false
+	PerModelKeys(s, func(_ string, m reflect.Value) {
+		if renameInMap(m, from, to) {
+			moved = true
+		}
+	})
+	return moved
+}
+
+// renameInMap is RenamePerModel for one of the maps: every key of from+"/..."
+// is written as to+"/...", and it says whether one moved. The new key is
+// built as a string and then converted to the map's own key type, because a
+// field keyed by a named string type (map[modelKey]X) is per-model all the
+// same, and a plain string is not assignable to one. Every per-model field
+// the settings have today is keyed by string, so nothing but a test on such
+// a type reaches that conversion.
+func renameInMap(m reflect.Value, from, to string) bool {
+	moved := false
+	for _, k := range m.MapKeys() {
+		rest, ok := strings.CutPrefix(k.String(), from+"/")
+		if !ok {
+			continue
+		}
+		v := m.MapIndex(k)
+		m.SetMapIndex(k, reflect.Value{})
+		m.SetMapIndex(reflect.ValueOf(to+"/"+rest).Convert(m.Type().Key()), v)
+		moved = true
+	}
+	return moved
+}
 
 // Path is the settings file.
 func Path() string {
@@ -190,6 +452,26 @@ func Load() Settings {
 	return s.normal()
 }
 
+// CheckProxy says whether p is a proxy setting magpie takes: "" (follow),
+// "direct", or an http://, https:// or socks5:// address (host:port
+// meaning http). The global Proxy and a provider's own are both checked
+// with it.
+func CheckProxy(p string) error {
+	p = strings.TrimSpace(p)
+	if p == "" || p == "direct" {
+		return nil
+	}
+	raw := p
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || !slices.Contains([]string{"http", "https", "socks5", "socks5h"}, u.Scheme) {
+		return fmt.Errorf("proxy must look like http://127.0.0.1:7890 or socks5://127.0.0.1:1080, not %q", p)
+	}
+	return nil
+}
+
 // Save validates and writes the settings.
 func Save(s Settings) error {
 	s = s.normal()
@@ -201,6 +483,9 @@ func Save(s Settings) error {
 	}
 	if !slices.Contains(Trays, s.Tray) {
 		return fmt.Errorf("tray must be one of %v, not %q", Trays, s.Tray)
+	}
+	if s.SessionTerminal != "" && s.SessionTerminal != "system" && !validTerminalBundleID.MatchString(s.SessionTerminal) {
+		return fmt.Errorf("session terminal must be an app bundle id or system, not %q", s.SessionTerminal)
 	}
 	if !slices.Contains(Currencies, s.Currency) {
 		return fmt.Errorf("currency must be one of %v, not %q", Currencies, s.Currency)
@@ -219,16 +504,18 @@ func Save(s Settings) error {
 	if !slices.Contains(TrayEvery, s.TrayUsageEvery) {
 		return fmt.Errorf("the menu bar's usage is refreshed every %v minutes, not %d", TrayEvery, s.TrayUsageEvery)
 	}
+	if s.UsageAlert < 0 || s.UsageAlert > 100 {
+		return fmt.Errorf("a usage alert is at a percentage from 1 to 100, or 0 for off, not %d", s.UsageAlert)
+	}
+	if math.IsNaN(s.BalanceAlert) || math.IsInf(s.BalanceAlert, 0) || s.BalanceAlert < 0 {
+		return fmt.Errorf("a balance alert is at an amount of 0 or more (0 for off), not %v", s.BalanceAlert)
+	}
+	if !slices.Contains(TextSizes, s.TextSize) {
+		return fmt.Errorf("text size must be one of %v percent, not %d", TextSizes, s.TextSize)
+	}
 	s.Proxy = strings.TrimSpace(s.Proxy)
-	if s.Proxy != "" && s.Proxy != "direct" {
-		raw := s.Proxy
-		if !strings.Contains(raw, "://") {
-			raw = "http://" + raw
-		}
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" || !slices.Contains([]string{"http", "https", "socks5", "socks5h"}, u.Scheme) {
-			return fmt.Errorf("proxy must look like http://127.0.0.1:7890 or socks5://127.0.0.1:1080, not %q", s.Proxy)
-		}
+	if err := CheckProxy(s.Proxy); err != nil {
+		return err
 	}
 	s.Vision = strings.TrimSpace(s.Vision)
 	if s.Vision != "" && s.Vision != "off" && !strings.Contains(s.Vision, "/") {
@@ -244,6 +531,15 @@ func Save(s Settings) error {
 	}
 	s.RedactRules = rules
 	s.AgentOrder, s.AgentsHidden, s.AgentsShown = ids(s.AgentOrder), ids(s.AgentsHidden), ids(s.AgentsShown)
+	s.TrayUsages = ids(s.TrayUsages)
+	for i, u := range s.CodexAutoReset {
+		s.CodexAutoReset[i] = strings.ToLower(u)
+	}
+	s.CodexAutoReset = ids(s.CodexAutoReset)
+	s.TrayUsage = ""
+	if len(s.TrayUsages) > 0 {
+		s.TrayUsage = s.TrayUsages[0]
+	}
 	if err := os.MkdirAll(Dir(), 0o755); err != nil {
 		return err
 	}
@@ -275,6 +571,14 @@ func (s Settings) normal() Settings {
 	}
 	if s.TrayUsageEvery == 0 {
 		s.TrayUsageEvery = 3
+	}
+	if s.TextSize == 0 {
+		s.TextSize = 100
+	}
+	// one card, as a magpie before TrayUsages kept it; an empty list
+	// sent on purpose (all of them turned off) stays empty
+	if s.TrayUsages == nil && s.TrayUsage != "" {
+		s.TrayUsages = []string{s.TrayUsage}
 	}
 	// a time of day as 06:00 whichever way it came (6:00, 06:00:00)
 	for _, at := range []*string{&s.CodexWarmAt, &s.ClaudeWarmAt} {

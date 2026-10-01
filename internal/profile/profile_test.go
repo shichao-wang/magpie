@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // sandbox is a home with Claude Code and Codex in it and nothing on PATH.
@@ -18,8 +21,9 @@ func sandbox(t *testing.T) string {
 	t.Setenv("HOME", h)
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(h, "AppData", "Local"))
 	t.Setenv("PATH", "")
-	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "COPILOT_HOME", "APPDATA"} {
+	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR", "COPILOT_HOME", "APPDATA"} {
 		t.Setenv(k, "")
 	}
 	for _, f := range []string{".claude/settings.json", ".codex/config.toml"} {
@@ -88,6 +92,45 @@ func TestOldProfiles(t *testing.T) {
 	}
 	if !strings.Contains(read(t, filepath.Join(h, ".claude/CLAUDE.md")), "Use tabs.") {
 		t.Error("an old profile changed the library")
+	}
+}
+
+func TestClaudeDesktopTierFields(t *testing.T) {
+	h := sandbox(t)
+	root := filepath.Join(h, "Library", "Application Support", "Claude")
+	if runtime.GOOS == "windows" {
+		root = filepath.Join(h, "AppData", "Local", "Claude")
+	} else if runtime.GOOS != "darwin" {
+		root = filepath.Join(h, ".config", "Claude")
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Chat: "https://fake.example/v1", Key: "k", Models: []string{"m1"}}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := agent.Find("claude-desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply("provider", "magpie"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Apply("haiku", "fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	fields := Fields()
+	if fields["claude-desktop.provider"] != "magpie" || fields["claude-desktop.haiku"] != "fake/m1" {
+		t.Fatalf("snapshot omitted Desktop's provider or tier: %v", fields)
+	}
+	if err := a.Apply("provider", ""); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := ApplyFields(fields); err != nil || n < 2 {
+		t.Fatalf("restore: %d changes, %v", n, err)
+	}
+	if a.Field("provider").Get() != "magpie" || a.Field("haiku").Get() != "fake/m1" {
+		t.Fatalf("restore didn't connect Desktop before setting its tier: %v", a.Values())
 	}
 }
 

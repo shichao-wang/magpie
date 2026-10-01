@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -56,7 +57,17 @@ type Asset struct {
 	SHA256 string `json:"sha256"`
 }
 
-var client = &http.Client{Timeout: 10 * time.Minute}
+// client asks the feed and downloads a release through the proxy the rest
+// of magpie's requests take — Settings' Proxy, else the environment's, else
+// the system's (#294) — on a transport of its own, whatever the process has
+// done to http.DefaultTransport.
+var client = &http.Client{Timeout: 10 * time.Minute, Transport: proxied()}
+
+func proxied() http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = netproxy.Func
+	return t
+}
 
 // Latest asks the feed for the newest release.
 func Latest(ctx context.Context) (*Release, error) {
@@ -442,11 +453,12 @@ func InstallBinaryAsAdmin(staged, exe string) error {
 	return err
 }
 
-// RelaunchBinary starts exe again as the tray app. The new process waits
-// for this one to exit before it takes the gateway's port; see
-// AwaitPredecessor.
-func RelaunchBinary(exe string) error {
-	cmd := proc.Command(exe, "tray")
+// RelaunchBinary starts exe again: with its window on view when window is
+// set (the window was open), else as the tray app alone, as autostart
+// starts it. The new process waits for this one to exit before it takes
+// the gateway's port; see AwaitPredecessor.
+func RelaunchBinary(exe string, window bool, view string) error {
+	cmd := proc.Command(exe, RelaunchArgs(window, view)...)
 	cmd.Env = append(os.Environ(), "MAGPIE_REPLACES="+strconv.Itoa(os.Getpid()))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	detach(cmd)
@@ -454,6 +466,18 @@ func RelaunchBinary(exe string) error {
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+// RelaunchArgs is what RelaunchBinary starts magpie with: `gui [view]` for
+// the window, `tray` for the tray icon alone.
+func RelaunchArgs(window bool, view string) []string {
+	switch {
+	case !window:
+		return []string{"tray"}
+	case view != "":
+		return []string{"gui", view}
+	}
+	return []string{"gui"}
 }
 
 // AwaitPredecessor blocks, for a while at most, until the magpie that
@@ -553,3 +577,6 @@ func (c *counter) Read(p []byte) (int, error) {
 	c.report(c.done, c.total)
 	return n, err
 }
+
+// Alive reports whether the process pid is still running.
+func Alive(pid int) bool { return alive(pid) }

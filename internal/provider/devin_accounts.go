@@ -63,7 +63,7 @@ type devinLogin struct {
 // devinLogins lists the Devin accounts that are signed in, the first in
 // use first, then the rest as they were added.
 func devinLogins() []devinLogin {
-	own, _, ok := devinIdentity()
+	own, plan, ok := devinIdentity()
 	if !ok {
 		own = ""
 	}
@@ -72,6 +72,9 @@ func devinLogins() []devinLogin {
 		_, _, err := DevinAuthAt(l.Home)
 		return l.Home != "" && err == nil
 	}) {
+		if l.saved.own() && l.Plan == "" {
+			l.Plan = plan // the CLI's own, by the tier `devin auth status` says, as the plugin names it
+		}
 		out = append(out, devinLogin{l.Login, l.saved.Home})
 	}
 	return out
@@ -97,9 +100,9 @@ func setDevinLoginOn(user string, on bool) error {
 }
 
 // forgetDevinLogin drops an account magpie signed in, with its home. The
-// CLI's own is signed out in the CLI.
+// CLI's own is only hidden (forgetSideLogin).
 func forgetDevinLogin(user string) error {
-	return forgetSideLogin("devin", user, "the devin CLI's own sign-in; run `devin auth logout` to sign it out", devinSide(),
+	return forgetSideLogin("devin", user, devinSide(),
 		func(l savedLogin) { removeDevinHome(l.Home) })
 }
 

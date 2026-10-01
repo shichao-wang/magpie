@@ -3,6 +3,8 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -117,6 +119,36 @@ func TestReseatDelete(t *testing.T) {
 	}
 }
 
+func TestReseatClaudeDesktopTiers(t *testing.T) {
+	home := reseatHome(t)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
+	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	os.MkdirAll(p.dir, 0o755)
+	a := mustFind(t, "claude-desktop")
+	mustApply(t, a, "provider", "magpie")
+	mustApply(t, a, "opus", "cop/claude-sonnet-4.5")
+	mustApply(t, a, "haiku", "cop/only-here")
+	mustApply(t, a, "sonnet", "ds/gpt-5")
+
+	moves, err := Reseat(func() error { return provider.SetOff("cop", true) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for tier, want := range map[string]string{"opus": "ds/claude-sonnet-4-5-20250929", "haiku": "", "sonnet": "ds/gpt-5"} {
+		if got := a.Field(tier).Get(); got != want {
+			t.Errorf("%s: %q, want %q", tier, got, want)
+		}
+	}
+	got := map[string]Move{}
+	for _, m := range moves {
+		got[m.Agent+" "+m.Field] = m
+	}
+	if got["Claude Desktop opus"].To != "ds/claude-sonnet-4-5-20250929" || got["Claude Desktop haiku"].To != "" {
+		t.Fatalf("Desktop tiers weren't reseated: %+v", moves)
+	}
+}
+
 func TestModelKey(t *testing.T) {
 	for a, b := range map[string]string{
 		"claude-sonnet-4.5":         "claude-sonnet-4-5-20250929",
@@ -130,5 +162,49 @@ func TestModelKey(t *testing.T) {
 	}
 	if modelKey("gpt-5") == modelKey("gpt-5-mini") {
 		t.Error("gpt-5 = gpt-5-mini")
+	}
+}
+
+// An agent that can't be moved (its config unwritable) doesn't fail the
+// change, which is made already: the others are moved and it is a move with
+// its error. An error here kept a removed provider's editor open in the
+// panel, the provider still listed, and a second Remove said "no provider".
+func TestReseatUnmovable(t *testing.T) {
+	home := reseatHome(t)
+	c, h := mustFind(t, "claude"), mustFind(t, "hermes")
+	mustApply(t, c, "model", "cop/only-here")
+	mustApply(t, h, "model", "magpie/cop/only-here")
+	dir := filepath.Join(home, ".hermes")
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	if f, err := os.Create(filepath.Join(dir, "probe")); err == nil {
+		f.Close()
+		t.Skip("a read-only folder is writable here (root?)")
+	}
+	os.Chmod(filepath.Join(dir, "config.yaml"), 0o444)
+
+	moves, err := Reseat(func() error { return provider.Delete("cop") })
+	if err != nil {
+		t.Fatalf("the provider is removed, but Reseat said: %v", err)
+	}
+	if _, err := provider.Find("cop"); err == nil {
+		t.Fatal("cop still there")
+	}
+	if got := c.Field("model").Get(); got != "" {
+		t.Errorf("claude not moved: %q", got)
+	}
+	var stuck *Move
+	for i, m := range moves {
+		if m.Agent == "Hermes Agent" {
+			stuck = &moves[i]
+		}
+	}
+	if len(moves) != 2 || stuck == nil || stuck.Error == "" || stuck.To != "" || stuck.From != "cop/only-here" {
+		t.Fatalf("moves: %+v", moves)
+	}
+	if s := stuck.String(); !strings.Contains(s, "not moved") {
+		t.Errorf("String: %q", s)
 	}
 }

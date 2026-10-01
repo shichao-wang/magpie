@@ -1,10 +1,14 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // ---- OpenAI Chat Completions --------------------------------------------------
@@ -34,6 +38,7 @@ type cRequest struct {
 			Name        string          `json:"name"`
 			Description string          `json:"description,omitempty"`
 			Parameters  json.RawMessage `json:"parameters,omitempty"`
+			Strict      *bool           `json:"strict,omitempty"`
 		} `json:"function"`
 	} `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
@@ -102,7 +107,7 @@ func parseChat(body []byte) (*Request, error) {
 		if t.Type != "" && t.Type != "function" {
 			continue
 		}
-		r.Tools = append(r.Tools, Tool{Name: t.Function.Name, Description: t.Function.Description, Schema: t.Function.Parameters})
+		r.Tools = append(r.Tools, Tool{Name: t.Function.Name, Description: t.Function.Description, Schema: t.Function.Parameters, Strict: t.Function.Strict != nil && *t.Function.Strict})
 	}
 	var tc string
 	if json.Unmarshal(c.ToolChoice, &tc) == nil {
@@ -174,7 +179,10 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	if r.System != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": r.System})
 	}
-	deepseek := strings.Contains(host, "deepseek")
+	// DeepSeek takes a turn's reasoning back, wherever its models are
+	// served (#388), as Command Code's plugin does for a Go key, as the
+	// built-in replayed it to /alpha/generate
+	replay := strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek") || host == provider.CommandCodePlanID
 	// A tool message holds text only, so the images tools returned go to
 	// the model in a user message after the tool messages, as the start of
 	// the user's own message when one comes next: some models' chat
@@ -229,7 +237,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			if len(calls) > 0 {
 				am["tool_calls"] = calls
 			}
-			if deepseek && think != "" {
+			if replay && think != "" {
 				am["reasoning_content"] = think
 			}
 			msgs = append(msgs, am)
@@ -292,6 +300,11 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	if r.Stream {
 		out["stream_options"] = map[string]any{"include_usage": true}
 	}
+	// Cursor's plugin reads fast mode here, as the built-in told Cursor;
+	// another's chat upstream may not know the tier
+	if r.Fast && host == "cursor" {
+		out["service_tier"] = "priority"
+	}
 	if r.MaxTokens > 0 {
 		if strings.HasSuffix(host, "openai.com") {
 			out["max_completion_tokens"] = r.MaxTokens
@@ -310,7 +323,19 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	if len(r.Stop) > 0 {
 		out["stop"] = r.Stop
 	}
-	if r.Effort != "" {
+	if r.GeminiCompat {
+		// Gemini thinks silently unless asked for its thoughts, and a long
+		// think read as the first word coming late (Claude Desktop waited
+		// 20 s for 你好); reasoning_effort can't be sent with them
+		if tc := aiStudioThinking(r, model); tc != nil {
+			out["extra_body"] = map[string]any{"google": map[string]any{"thinking_config": tc}}
+		} else if r.ThinkOff {
+			// Gemini 3 can't stop thinking; it thinks least at minimal
+			out["reasoning_effort"] = "minimal"
+		} else if r.Effort != "" {
+			out["reasoning_effort"] = r.Effort
+		}
+	} else if r.Effort != "" {
 		out["reasoning_effort"] = r.Effort
 	}
 	if len(r.Tools) > 0 {
@@ -339,6 +364,96 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	}
 	b, _ := json.Marshal(out)
 	return b
+}
+
+// aiStudioHost is Google AI Studio's Gemini API, whose OpenAI-compatible
+// endpoint gives the model's thoughts only when asked for them.
+const aiStudioHost = "generativelanguage.googleapis.com"
+
+// geminiCompat reports whether a Chat upstream at host serving model is
+// Gemini's OpenAI-compatible API: AI Studio's own, or for a Gemini model a
+// proxy on this machine or the LAN, which is most often one in front of it
+// (X @saoyan25's). A relay elsewhere is not assumed to pass thinking_config
+// on, or to take it.
+func geminiCompat(host, model string) bool {
+	if host == aiStudioHost {
+		return true
+	}
+	if !strings.Contains(strings.ToLower(model), "gemini") {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if host == "localhost" || strings.HasSuffix(host, ".local") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
+}
+
+// thinkingEffort moves the level the new Kimi Code (2.x) asks a Chat
+// request for, inside its thinking switch ({"type":"enabled","effort":
+// "high"}, #333), to reasoning_effort: where kimi-cli put it, beside
+// thinking's type, and where the gateway and every other Chat API read it.
+// A request that says reasoning_effort itself is left as it is.
+func thinkingEffort(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"effort"`)) {
+		return body
+	}
+	var v struct {
+		ReasoningEffort *string        `json:"reasoning_effort"`
+		Thinking        map[string]any `json:"thinking"`
+	}
+	if json.Unmarshal(body, &v) != nil || v.ReasoningEffort != nil {
+		return body
+	}
+	effort, _ := v.Thinking["effort"].(string)
+	if effort == "" {
+		return body
+	}
+	delete(v.Thinking, "effort")
+	return withFields(body, map[string]any{"reasoning_effort": effort, "thinking": v.Thinking})
+}
+
+// thinkingConfigField is Gemini's thinking_config as unfit remembers a
+// provider that refused it.
+const thinkingConfigField = "thinking_config"
+
+// refusesThinkingConfig recognizes an upstream turning a request away for
+// the thinking_config it was sent, by its error naming it.
+func refusesThinkingConfig(status int, body []byte) bool {
+	if !badRequest(status) {
+		return false
+	}
+	b := bytes.ToLower(body)
+	return bytes.Contains(b, []byte("extra_body")) || bytes.Contains(b, []byte("thinking")) || bytes.Contains(b, []byte("include_thoughts"))
+}
+
+// aiStudioThinking is the thinking_config asking Gemini for its thoughts at
+// the effort the client asked, for a client that asked to see them: a level
+// for Gemini 3 and later, a budget for 2.x (the steps Google maps
+// reasoning_effort to).
+func aiStudioThinking(r *Request, model string) map[string]any {
+	if !r.Thinking || r.ThinkOff || r.Effort == "none" {
+		return nil
+	}
+	tc := map[string]any{"include_thoughts": true}
+	level := r.Effort
+	switch level {
+	case "xhigh", "max":
+		level = "high"
+	case "minimal", "low", "medium", "high":
+	default:
+		return tc // the model's own
+	}
+	if strings.Contains(strings.ToLower(model), "gemini-2") {
+		tc["thinking_budget"] = map[string]int{"minimal": 1024, "low": 1024, "medium": 8192, "high": 24576}[level]
+	} else {
+		tc["thinking_level"] = level
+	}
+	return tc
 }
 
 type cUsage struct {
@@ -400,7 +515,76 @@ func (u Usage) chat() map[string]any {
 type chatDecoder struct {
 	started bool
 	tool    int    // index of the open tool call, -1 for none
+	toolID  string // id of the open tool call, as some relays repeat it on every fragment
 	choice  string // index of the first choice seen; an empty string means none yet
+	// Gemini's OpenAI-compatible API, asked for thoughts, may give them
+	// in the text as a leading <thought>…</thought>: lead holds the text
+	// while it could still be that tag's start, thought is being inside it
+	lead    string
+	thought bool
+	past    bool // the reply's text has begun; no tag is looked for now
+}
+
+const thoughtOpen, thoughtClose = "<thought>", "</thought>"
+
+// text sends a piece of the reply's text, a leading <thought> block of it
+// as thinking.
+func (d *chatDecoder) text(s string, emit func(Event)) {
+	if !d.past && !d.thought {
+		d.lead += s
+		lead := strings.TrimLeft(d.lead, " \n")
+		if len(lead) < len(thoughtOpen) && strings.HasPrefix(thoughtOpen, lead) {
+			return
+		}
+		if !strings.HasPrefix(lead, thoughtOpen) {
+			d.past = true
+			s, d.lead = d.lead, ""
+			emit(Event{Kind: KText, Text: s})
+			return
+		}
+		s, d.lead, d.thought = strings.TrimPrefix(lead, thoughtOpen), "", true
+	}
+	if d.thought {
+		s = d.lead + s
+		d.lead = ""
+		if i := strings.Index(s, thoughtClose); i >= 0 {
+			if i > 0 {
+				emit(Event{Kind: KThink, Text: s[:i]})
+			}
+			d.thought, d.past = false, true
+			s = strings.TrimLeft(s[i+len(thoughtClose):], "\n")
+		} else {
+			// the end of it may be the close tag begun
+			keep := 0
+			for n := min(len(thoughtClose)-1, len(s)); n > 0; n-- {
+				if strings.HasSuffix(s, thoughtClose[:n]) {
+					keep = n
+					break
+				}
+			}
+			if t := s[:len(s)-keep]; t != "" {
+				emit(Event{Kind: KThink, Text: t})
+			}
+			d.lead = s[len(s)-keep:]
+			return
+		}
+	}
+	if s != "" {
+		emit(Event{Kind: KText, Text: s})
+	}
+}
+
+// end gives back what text was held to see whether a tag began.
+func (d *chatDecoder) end(emit func(Event)) {
+	if d.lead == "" {
+		return
+	}
+	k := KText
+	if d.thought {
+		k = KThink
+	}
+	emit(Event{Kind: k, Text: d.lead})
+	d.lead = ""
 }
 
 func (d *chatDecoder) decode(data string, emit func(Event)) error {
@@ -429,7 +613,7 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 		return nil
 	}
 	if ch.Error != nil {
-		emit(Event{Kind: KError, Text: ch.Error.Message})
+		emit(Event{Kind: KError, Text: ch.Error.Message, Code: refusedCode(data)})
 		return nil
 	}
 	if !d.started {
@@ -457,24 +641,31 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 			emit(Event{Kind: KThink, Text: t})
 		}
 		if c.Delta.Content != nil && *c.Delta.Content != "" {
-			emit(Event{Kind: KText, Text: *c.Delta.Content})
+			d.text(*c.Delta.Content, emit)
+		}
+		if len(c.Delta.ToolCalls) > 0 {
+			d.end(emit)
 		}
 		for i, tc := range c.Delta.ToolCalls {
 			idx := i
 			if tc.Index != nil {
 				idx = *tc.Index
 			}
-			if tc.ID != "" || tc.Function.Name != "" || idx != d.tool {
-				if idx != d.tool || tc.ID != "" {
-					d.tool = idx
-					emit(Event{Kind: KToolStart, ID: tc.ID, Name: tc.Function.Name})
-				}
+			// A delta carrying the id the open call already goes by — some
+			// relays repeat it on every fragment, where the spec sends it
+			// only on the first — or one more fragment of the open index,
+			// continues that call; only a new id or a new index starts the
+			// next one.
+			if idx != d.tool || (tc.ID != "" && tc.ID != d.toolID) {
+				d.tool, d.toolID = idx, tc.ID
+				emit(Event{Kind: KToolStart, ID: tc.ID, Name: tc.Function.Name})
 			}
 			if tc.Function.Arguments != "" {
 				emit(Event{Kind: KToolArgs, Text: tc.Function.Arguments})
 			}
 		}
 		if c.FinishReason != "" {
+			d.end(emit)
 			emit(Event{Kind: KStop, Stop: stopFromChat(c.FinishReason)})
 		}
 	}
@@ -607,7 +798,11 @@ func (e *chatEncoder) event(ev Event) {
 				"function": map[string]any{"arguments": ev.Text}}}}, nil, nil)
 		}
 	case KError:
-		e.w.event("", map[string]any{"error": map[string]any{"message": ev.Text, "type": "api_error"}})
+		failed := map[string]any{"message": ev.Text, "type": "api_error"}
+		if ev.Code != "" {
+			failed["code"] = ev.Code // preserve the upstream error type, including refusals
+		}
+		e.w.event("", map[string]any{"error": failed})
 	}
 	e.col.add(ev)
 }

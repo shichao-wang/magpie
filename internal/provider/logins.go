@@ -21,7 +21,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // Login is a remembered subscription account, without its secrets.
@@ -35,6 +38,15 @@ type Login struct {
 	// Lapsed says the vendor refused to refresh a saved account's sign-in:
 	// it has to be signed in again before it can be used.
 	Lapsed string `json:"lapsed,omitempty"`
+	// Own is the agent's own sign-in, which magpie only reads: removed, it
+	// is hidden rather than deleted (side_logins.go).
+	Own bool `json:"own,omitempty"`
+	// Paused is the account the agent is signed in to, passed over by the
+	// gateway while another is on (savedLogin.Paused).
+	Paused bool `json:"paused,omitempty"`
+	// Returns is the account magpie signed the agent out of when it was
+	// spent, and signs it back in to once it has room again (#408).
+	Returns bool `json:"returns,omitempty"`
 }
 
 type savedLogin struct {
@@ -63,6 +75,14 @@ type savedLogin struct {
 	// Lapsed why the vendor last refused to (logins_on.go, keepalive.go).
 	Renewed time.Time `json:"renewed,omitzero"`
 	Lapsed  string    `json:"lapsed,omitempty"`
+	// Hidden is the agent's own sign-in removed in magpie, with the mark
+	// of the sign-in it was (side_logins.go): it is listed and tried no
+	// more until the agent signs in anew. The agent's files stay as they are.
+	Hidden string `json:"hidden,omitempty"`
+	// Paused is set on the account the agent is signed in to when the user
+	// paused it in magpie (#263): the gateway passes over it while another
+	// of the agent's accounts is on, the agent staying signed in to it.
+	Paused bool `json:"paused,omitempty"`
 }
 
 var (
@@ -83,6 +103,10 @@ func readLogins() []savedLogin {
 	ls, _ := filememo.Read("logins", loginsPath(), func(b []byte) ([]savedLogin, error) {
 		var out []savedLogin
 		_ = json.Unmarshal(b, &out)
+		// DimAgent's accounts: magpie no longer signs in to it (DimAgent
+		// doesn't allow its subscription used outside its client), so one
+		// signed in before is left out, and gone from the file at its next write
+		out = slices.DeleteFunc(out, func(l savedLogin) bool { return l.Agent == "dimagent" })
 		return dedupeLogins(out), nil
 	})
 	return slices.Clone(ls) // callers change theirs
@@ -105,6 +129,10 @@ func writeLogins(ls []savedLogin) error {
 // writePrivate replaces a file readable by the user alone, atomically, so
 // an agent reading it at that moment sees either version, never half.
 func writePrivate(path string, b []byte) error {
+	path, err := edit.Target(path) // a symlink stays, its target written
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -124,13 +152,14 @@ func writePrivate(path string, b []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	return steady.Rename(tmp.Name(), path)
 }
 
 func upsertLogin(ls []savedLogin, l savedLogin) []savedLogin {
 	for i := range ls {
 		if sameLogin(ls[i], l) {
 			l.On = l.On || ls[i].On
+			l.Paused = l.Paused || ls[i].Paused
 			ls[i] = l
 			return ls
 		}
@@ -168,6 +197,7 @@ func dedupeLogins(ls []savedLogin) []savedLogin {
 			keep = l
 		}
 		keep.On = previous.On || l.On
+		keep.Paused = previous.Paused || l.Paused
 		keep.First = previous.First || l.First
 		out[found] = keep
 	}
@@ -319,8 +349,10 @@ func claudeSignedInUser(plan, statusPlan, status string) (user string, acct map[
 // none.
 func savedButSignedOut() []Exclusion {
 	saved := map[string]int{}
+	users := map[string][]string{}
 	for _, l := range readLogins() {
 		saved[l.Agent]++
+		users[l.Agent] = append(users[l.Agent], l.User)
 	}
 	var out []Exclusion
 	for _, a := range loginAgents {
@@ -338,7 +370,7 @@ func savedButSignedOut() []Exclusion {
 		if saved[a] > 1 {
 			n = fmt.Sprintf("%d accounts are", saved[a])
 		}
-		out = append(out, Exclusion{Agent: a, SignedOut: true,
+		out = append(out, Exclusion{Agent: a, SignedOut: true, Users: users[a],
 			Why: fmt.Sprintf("%s saved in magpie, but it isn't signed in here (%s), and they are only offered beside the account it is signed in to. Sign in (%s) with this HOME.", n, why, signIn)})
 	}
 	return out
@@ -453,6 +485,9 @@ func rememberLogins(force bool) {
 // Logins lists the remembered accounts of an agent ("" for every one),
 // the active one flagged.
 func Logins(agent string) []Login {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return pluginLoginList(pp)
+	}
 	var side []Login
 	switch agent {
 	case "grok":
@@ -469,21 +504,54 @@ func Logins(agent string) []Login {
 		return wbLoginList(wbSiteOf(agent))
 	case CommandCodePlanID:
 		return cmdLoginList()
-	case "qoder":
-		return loginsOf(qoderLogins())
+	case "qoder", QoderCNID:
+		return loginsOf(qoderLoginsOf(agent))
+	case "zed":
+		return zedLoginList()
+	case "factory":
+		return factoryLoginList()
+	case MiMoID:
+		return mimoLoginList()
 	case "gemini", "antigravity":
 		return googleLoginList(agent)
 	case "":
-		side = append(grokLoginList(), copilotLoginList()...)
-		side = append(side, zcodeLoginList()...)
-		side = append(side, kiroLoginList()...)
-		side = append(side, devinLoginList()...)
-		side = append(side, wbLoginList(wbCN)...)
-		side = append(side, wbLoginList(wbAI)...)
-		side = append(side, cmdLoginList()...)
-		side = append(side, loginsOf(qoderLogins())...)
-		side = append(side, googleLoginList("gemini")...)
-		side = append(side, googleLoginList("antigravity")...)
+		// a plugin's accounts go by its provider's id (a moved built-in's
+		// by the built-in's), the one in use first marked, as its own page
+		// lists them
+		byPlugin := map[string][]Login{}
+		for _, pp := range plugin.Cached() {
+			for _, l := range pluginLoginList(pp) {
+				l.Agent = PluginID(pp.ID)
+				byPlugin[pp.ID] = append(byPlugin[pp.ID], l)
+			}
+		}
+		// a built-in moved onto its plugin lists its accounts there (an
+		// agent's own sign-in, which the built-in still finds, too)
+		for _, b := range []struct {
+			id   string
+			list func() []Login
+		}{
+			{"grok", grokLoginList}, {"copilot", copilotLoginList}, {"zcode", zcodeLoginList}, {"kiro", kiroLoginList},
+			{"devin", devinLoginList}, {"workbuddy", func() []Login { return wbLoginList(wbCN) }},
+			{WorkBuddyAIID, func() []Login { return wbLoginList(wbAI) }}, {CommandCodePlanID, cmdLoginList},
+			{"qoder", func() []Login { return loginsOf(qoderLogins()) }},
+			{QoderCNID, func() []Login { return loginsOf(qoderLoginsOf(QoderCNID)) }}, {"zed", zedLoginList}, {"factory", factoryLoginList},
+			{MiMoID, mimoLoginList}, {"gemini", func() []Login { return googleLoginList("gemini") }},
+			{"antigravity", func() []Login { return googleLoginList("antigravity") }},
+		} {
+			if !Moved(b.id) {
+				side = append(side, b.list()...)
+				continue
+			}
+			// a moved built-in's, from its plugin, where the built-in's stood
+			side = append(side, byPlugin[b.id]...)
+			delete(byPlugin, b.id)
+		}
+		// the other plugins' after them
+		for _, pp := range plugin.Cached() {
+			side = append(side, byPlugin[pp.ID]...)
+			delete(byPlugin, pp.ID)
+		}
 	}
 	rememberLogins(false)
 	loginsMu.Lock()
@@ -495,18 +563,48 @@ func Logins(agent string) []Login {
 		}
 	}
 	var out []Login
-	for _, l := range readLogins() {
-		if (agent != "" && l.Agent != agent) || sideAgent(l.Agent) {
+	ls := readLogins()
+	back := map[string]string{}
+	for a, user := range active {
+		if r, ok := loginReturnOf(a, user); ok {
+			back[a] = r.Back
+		}
+	}
+	for _, l := range ls {
+		if (agent != "" && l.Agent != agent) || sideAgent(l.Agent) || strings.HasPrefix(l.Agent, "plugin:") {
 			continue
 		}
 		using := strings.EqualFold(active[l.Agent], l.User)
-		lg := Login{Agent: l.Agent, User: l.User, Plan: l.Plan, Seen: l.Seen, Active: using, On: using || l.On}
+		lg := Login{Agent: l.Agent, User: l.User, Plan: l.Plan, Seen: l.Seen, Active: using, On: using || l.On,
+			Paused: using && pausedOwn(ls, l.Agent, l.User)}
 		if !using {
 			lg.Lapsed = l.Lapsed
+			lg.Returns = l.On && strings.EqualFold(back[l.Agent], l.User)
 		}
 		out = append(out, lg)
 	}
 	return append(out, side...)
+}
+
+// InUseLogin is the account of an agent's the gateway goes to first: the
+// one the agent is signed in to, unless it is paused, else the first other
+// one on; "" when the agent has none.
+func InUseLogin(agent string) string {
+	return inUseOf(Logins(agent))
+}
+
+func inUseOf(ls []Login) string {
+	for _, l := range ls {
+		if l.Active && !l.Paused {
+			return l.User
+		}
+	}
+	for _, l := range ls {
+		if l.On && !l.Paused {
+			return l.User
+		}
+	}
+	return ""
 }
 
 // SwitchLogin signs an agent in to a remembered account. Sessions of the
@@ -514,6 +612,18 @@ func Logins(agent string) []Login {
 // they restart; so does Codex's background app-server, which new Codex
 // sessions attach to (CodexDaemonStale says when it is).
 func SwitchLogin(agent, user string) error {
+	// the user's own choice: magpie doesn't sign the agent back in to the
+	// account it moved it off
+	if slices.Contains(loginAgents, agent) {
+		setLoginReturn(agent, loginReturn{})
+	}
+	return switchLogin(agent, user)
+}
+
+func switchLogin(agent, user string) error {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return switchPluginLogin(pp, user)
+	}
 	switch agent {
 	case "grok":
 		return switchGrokLogin(user)
@@ -529,8 +639,14 @@ func SwitchLogin(agent, user string) error {
 		return switchWorkBuddyLogin(wbSiteOf(agent), user)
 	case CommandCodePlanID:
 		return switchCommandCodeLogin(user)
-	case "qoder":
-		return switchSideLogin("qoder", user, qoderLogins())
+	case "qoder", QoderCNID:
+		return switchSideLogin(agent, user, qoderLoginsOf(agent))
+	case "zed":
+		return switchZedLogin(user)
+	case "factory":
+		return switchFactoryLogin(user)
+	case MiMoID:
+		return switchMiMoLogin(user)
 	case "gemini", "antigravity":
 		return switchGoogleLogin(agent, user)
 	}
@@ -561,6 +677,15 @@ func switchSavedLogin(agent, user string) (from string, _ error) {
 	if target == nil {
 		return "", fmt.Errorf("no saved %s account %q", agent, user)
 	}
+	if agent == "claude" {
+		// as Claude Code keeps it, if it has run on the account beside the
+		// one it is signed in to
+		if c, ok := readClaudeDir(claudeAccountDir(target.User)); ok {
+			if _, err := takeClaudeDir(target, c); err != nil {
+				return "", err
+			}
+		}
+	}
 	want := *target
 	if live, ok := liveLogin(agent); ok {
 		if strings.EqualFold(live.User, want.User) {
@@ -573,7 +698,7 @@ func switchSavedLogin(agent, user string) (from string, _ error) {
 		ls = upsertLogin(ls, live)
 		for i := range ls {
 			if ls[i].Agent == agent && strings.EqualFold(ls[i].User, live.User) {
-				ls[i].On = want.On
+				ls[i].On, ls[i].Paused = want.On, false
 			}
 		}
 		if err := writeLogins(ls); err != nil {
@@ -585,7 +710,10 @@ func switchSavedLogin(agent, user string) (from string, _ error) {
 	case "codex":
 		err = writePrivate(codexAuthPath(), append(bytes.TrimSpace(want.Auth), '\n'))
 	case "claude":
-		err = putClaudeLogin(want)
+		if err = putClaudeLogin(want); err == nil {
+			// Claude Code's own now: its only holder
+			forgetClaudeDir(want.User)
+		}
 	default:
 		err = fmt.Errorf("%s accounts can't be switched", agent)
 	}
@@ -648,6 +776,9 @@ func putClaudeLogin(l savedLogin) error {
 // ForgetLogin drops a remembered account. The one an agent is signed in to
 // now can't be forgotten; it would only be remembered again.
 func ForgetLogin(agent, user string) error {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return forgetPluginLogin(pp, user)
+	}
 	switch agent {
 	case "grok":
 		return forgetGrokLogin(user)
@@ -663,8 +794,14 @@ func ForgetLogin(agent, user string) error {
 		return forgetWorkBuddyLogin(wbSiteOf(agent), user)
 	case CommandCodePlanID:
 		return forgetCommandCodeLogin(user)
-	case "qoder":
-		return forgetQoderLogin(user)
+	case "qoder", QoderCNID:
+		return forgetQoderLogin(agent, user)
+	case "zed":
+		return forgetZedLogin(user)
+	case "factory":
+		return forgetFactoryLogin(user)
+	case MiMoID:
+		return forgetMiMoLogin(user)
 	case "gemini", "antigravity":
 		return forgetGoogleLogin(agent, user)
 	}
@@ -685,6 +822,9 @@ func ForgetLogin(agent, user string) error {
 	}
 	if !found {
 		return fmt.Errorf("no saved %s account %q", agent, user)
+	}
+	if agent == "claude" {
+		forgetClaudeDir(user)
 	}
 	return writeLogins(out)
 }

@@ -185,6 +185,10 @@ func reseatCmd(change func() error, done string) tea.Cmd {
 			return flashMsg{text: err.Error()}
 		}
 		for _, mv := range moved {
+			if mv.Error != "" {
+				done += "; " + mv.String()
+				continue
+			}
 			done += "; moved " + mv.String()
 		}
 		return flashMsg{text: done, ok: true}
@@ -442,6 +446,7 @@ var periodNames = map[usage.Period]string{usage.Today: "today", usage.Week: "7 d
 type quotaMsg []provider.SubscriptionQuota
 
 func quotasCmd() tea.Msg {
+	provider.AskClaudeUsage() // the page opened, or r pressed
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	return quotaMsg(provider.Quotas(ctx))
@@ -676,12 +681,12 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 			cells = append(cells, quotaCell(w, left, now))
 		}
 		if r := q.Resets; r != nil {
-			c := sText.Render("↺ 1 reset")
-			if r.Count != 1 {
-				c = sText.Render(fmt.Sprintf("↺ %d resets", r.Count))
-			}
+			c := sText.Render("↺ " + r.Words())
 			if r.Until != nil {
 				c += sFaint.Render(" until " + provider.ResetClock(*r.Until, now))
+			}
+			if provider.AutoResets(q.Provider, q.User) {
+				c += sFaint.Render(" · auto") // spent by itself once the week is used up
 			}
 			cells = append(cells, c)
 		}

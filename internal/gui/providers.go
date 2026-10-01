@@ -22,16 +22,18 @@ import (
 // with one key, the gateway that fronts them, and who is routed where.
 
 type modelJSON struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`              // the user's name for it, if they gave one
-	Default string   `json:"default,omitempty"` // its own name, when the user gave it another
-	Kept    []string `json:"kept,omitempty"`    // the reasoning levels the user keeps of Efforts, when not all
-	Efforts []string `json:"efforts,omitempty"`
-	Given   bool     `json:"given,omitempty"` // its levels aren't known: Efforts are those it can be given, Kept those it was
-	On      bool     `json:"on"`              // exposed to agents
-	Context int      `json:"context,omitempty"`
-	Max     int      `json:"max,omitempty"`  // the most its context may be set to, above Context
-	Free    bool     `json:"free,omitempty"` // costs the subscription nothing
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`              // the user's name for it, if they gave one
+	Default  string   `json:"default,omitempty"` // its own name, when the user gave it another
+	Kept     []string `json:"kept,omitempty"`    // the reasoning levels the user keeps of Efforts, when not all
+	Efforts  []string `json:"efforts,omitempty"`
+	Given    bool     `json:"given,omitempty"`    // its levels aren't known: Efforts are those it can be given, Kept those it was
+	Images   bool     `json:"images"`             // agents are told it can see images
+	ImageSet bool     `json:"imageSet,omitempty"` // the user said so, rather than its vendor
+	On       bool     `json:"on"`                 // exposed to agents
+	Context  int      `json:"context,omitempty"`
+	Max      int      `json:"max,omitempty"`  // the most its context may be set to, above Context
+	Free     bool     `json:"free,omitempty"` // costs the subscription nothing
 }
 
 type providerJSON struct {
@@ -48,6 +50,14 @@ type providerJSON struct {
 	Website   string            `json:"website"`
 	KeysURL   string            `json:"keysUrl"`
 	Headers   map[string]string `json:"headers,omitempty"`
+	// the vendor searches the web by itself (provider.Searches)
+	Searches bool `json:"searches"`
+	// the proxy its requests go through: "" the global one, "direct"
+	// none, or an address (#237)
+	Proxy string `json:"proxy"`
+	// the proxy of each of a subscription's accounts that has one of its
+	// own, by its name in lower case; the others follow Proxy
+	AccountProxies map[string]string `json:"accountProxies,omitempty"`
 	// where a custom provider's balance is asked (see provider.Balance)
 	BalanceURL  string `json:"balanceURL,omitempty"`
 	BalancePath string `json:"balancePath,omitempty"`
@@ -61,6 +71,9 @@ type providerJSON struct {
 	// a StepFun provider's Step Plan windows, told only to a platform
 	// sign-in: which site's, and whether one is kept
 	StepPlan *stepPlanJSON `json:"stepPlan,omitempty"`
+	// a Zhipu or Z.ai key's team, for a team's GLM Coding Plan (#236):
+	// set, if empty, for those providers alone, which the editor asks it of
+	ZhipuTeam *provider.ZhipuTeam `json:"zhipuTeam,omitempty"`
 
 	Key struct {
 		Set      bool   `json:"set"`
@@ -77,13 +90,29 @@ type providerJSON struct {
 	Draws     int                `json:"draws,omitempty"`    // how many of its models draw images (gateway.Drawers)
 	DrawIDs   []string           `json:"drawIds,omitempty"`  // those models' ids, listed apart in its editor
 	Unlisted  bool               `json:"unlisted"`           // its models serve only through routing groups
+	// Groups are the routing groups ("group/<id>") each of its models is
+	// in, by model id: what an unlisted one is still used through, and the
+	// editor names those in none
+	Groups map[string][]string `json:"groups,omitempty"`
 	Off       bool               `json:"off"`                // switched off: kept, but agents get none of its models
 	Contexts  map[string]int     `json:"contexts,omitempty"` // the windows the user set, "*" for all its models
-	Fetched   string             `json:"fetched"`            // "3h ago" when the list came from the vendor
+	Fetched   *time.Time         `json:"fetched,omitempty"`  // when the list came from the vendor; the page says how long ago in its language
 	Agents    []providerAgent    `json:"agents"`             // detected agents, current ones flagged
 	Sponsored bool               `json:"sponsored"`
 	KeyList   []provider.KeyInfo `json:"keyList"`           // its keys, in the order requests try them
 	Account   *accountJSON       `json:"account,omitempty"` // a signed-in agent, see provider.Account
+	// Move is where a built-in subscription stands with the community
+	// plugin that can run it (provider.Move): set for those that have one
+	Move *moveJSON `json:"move,omitempty"`
+}
+
+type moveJSON struct {
+	Package string `json:"package"`
+	// State is "" (built-in, never moved), "plugin", "back" or "failed"
+	State string `json:"state"`
+	Error string `json:"error,omitempty"`
+	// Why is a failed move's reason, which the page says in its language
+	Why *provider.MoveWhy `json:"why,omitempty"`
 }
 
 // stepPlanJSON: whether a StepFun provider's platform sign-in is kept, and
@@ -116,6 +145,9 @@ type providerAgent struct {
 type presetJSON struct {
 	provider.PresetDef
 	Added bool `json:"added"`
+	// ZhipuTeam: a key of it may be on a team's GLM Coding Plan, whose
+	// organization and project the editor offers to take
+	ZhipuTeam bool `json:"zhipuTeam,omitempty"`
 }
 
 type gatewayJSON struct {
@@ -125,7 +157,8 @@ type gatewayJSON struct {
 	Window  bool           `json:"window"` // the magpie serving it shows its routing
 	Models  int            `json:"models"`
 	Calls   []gateway.Call `json:"calls"`
-	Groups  []gwGroupJSON  `json:"groups"` // the catalog's routing groups, listed before the models
+	Groups  []gwGroupJSON  `json:"groups"`  // the catalog's routing groups, listed before the models
+	Archive archiveJSON    `json:"archive"` // the request archive's switch, and where it goes
 }
 
 // gwGroupJSON is a routing group as the Gateway view lists it.
@@ -151,6 +184,11 @@ type providersJSON struct {
 	// signed in to after Codex was switched to another; "" when none is
 	// left behind (provider.CodexDaemonStale).
 	CodexDaemon string `json:"codexDaemon,omitempty"`
+	// Plugins are the providers the plugins sign in to, for the add sheet
+	Plugins []pluginSubJSON `json:"plugins"`
+	// OnPlugins are the built-in subscriptions moved onto their plugins,
+	// which the add sheet offers as the plugin's alone
+	OnPlugins []string `json:"onPlugins,omitempty"`
 	// Moved is the agents the change moved off models it stopped serving
 	// (agent.Reseat), for the page to say so.
 	Moved []agent.Move `json:"moved,omitempty"`
@@ -196,7 +234,7 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		ID: p.ID, Name: p.Name, Icon: p.Icon, Preset: p.Preset, Host: p.Host(),
 		Chat: p.Chat, Responses: p.Responses, Anthropic: p.Anthropic, Decide: p.Decide,
 		Catalog: p.Catalog, Website: p.Website, KeysURL: p.KeysURL,
-		Headers: p.Headers, BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, ModelsURL: p.ModelsURL,
+		Proxy: p.Proxy, AccountProxies: p.AccountProxies, Headers: p.Headers, Searches: p.Searches, BalanceURL: p.BalanceURL, BalancePath: p.BalancePath, ModelsURL: p.ModelsURL,
 		Ready: p.Ready(), Chosen: p.Models, Models: []modelJSON{}, Agents: []providerAgent{},
 		Fallback: p.Fallback, Routing: p.Routing, Affinity: p.Affinity, Unlisted: p.Unlisted, Off: p.Off, Contexts: p.Contexts,
 	}
@@ -211,11 +249,24 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		out.Key.Optional = pr.NoKey
 	}
 	out.BalanceToken.Takes, out.BalanceToken.Set = provider.TakesBalanceToken(p), p.BalanceToken != ""
+	if provider.TakesZhipuTeam(p) {
+		out.ZhipuTeam = &provider.ZhipuTeam{}
+		if p.ZhipuTeam != nil {
+			*out.ZhipuTeam = *p.ZhipuTeam
+		}
+	}
 	if site := provider.StepFunSite(p); site != "" {
 		out.StepPlan = &stepPlanJSON{site, provider.StepFunSignedIn(site), provider.StepFunSignInURL(site), provider.StepFunBookmarklet()}
 	}
 	out.Key.Set = p.Key != ""
 	out.Key.Masked = provider.Mask(p.Key)
+	if provider.Movable(p.ID) {
+		m, _ := provider.MigrationOf(p.ID)
+		out.Move = &moveJSON{Package: provider.MovePackage(p.ID), State: m.State, Error: m.Err, Why: m.Why}
+		if m.State == provider.MoveMoving {
+			out.Move.State = ""
+		}
+	}
 	out.KeyList = p.KeyList()
 	if out.KeyList == nil {
 		out.KeyList = []provider.KeyInfo{}
@@ -223,9 +274,23 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 	if !out.Key.Set && p.Ready() {
 		out.Key.Optional = true
 	}
+	for id, gs := range provider.MemberGroups() {
+		if m, ok := strings.CutPrefix(id, p.ID+"/"); ok {
+			if out.Groups == nil {
+				out.Groups = map[string][]string{}
+			}
+			out.Groups[m] = gs
+		}
+	}
 	if a := p.Account; a != nil {
 		out.Account = &accountJSON{Account: *a, Agent: a.Agent, Name: a.Agent, Icon: "generic"}
-		if ag, err := agent.Find(a.Agent); err == nil {
+		if a.Agent == "factory" {
+			// a Factory subscription is magpie's own sign-in, not Droid's
+			out.Account.Name, out.Account.Icon = "Factory", "factory"
+		} else if a.Agent == provider.MiMoID {
+			// a Xiaomi MiMo account, not MiMo Code (the agent "mimo" also names)
+			out.Account.Name, out.Account.Icon = "Xiaomi MiMo", "mimocode"
+		} else if ag, err := agent.Find(a.Agent); err == nil {
 			out.Account.Name, out.Account.Icon = ag.Name, ag.Icon
 		} else if a.Agent == "cursor" {
 			// a Cursor subscription is served by the gateway, not an agent magpie configures
@@ -243,6 +308,18 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 			out.Account.Name, out.Account.Icon = "Command Code", "commandcode"
 		}
 		out.Account.Logins = provider.Logins(a.Agent)
+		if pp, ok := provider.PluginOf(p.ID); ok && p.IsPlugin() {
+			// a plugin's sign-in: named for the provider it signs in to,
+			// the page following it by the provider's id
+			out.Account.Agent, out.Account.Name, out.Account.Icon = p.ID, pp.Name, pluginIcon(pp)
+			if provider.Moved(pp.ID) {
+				out.Account.Icon = p.Icon // the built-in's, as it was
+			}
+			out.Account.Logins = provider.Logins(p.ID)
+			if out.Icon == "" || out.Icon == "generic" {
+				out.Icon = out.Account.Icon
+			}
+		}
 	}
 	exposed := map[string]bool{}
 	for _, m := range p.Exposed() {
@@ -257,7 +334,13 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		most = catalog.Codex()
 	}
 	named := func(m catalog.Model, on bool) modelJSON {
-		j := modelJSON{ID: m.ID, Name: m.Name, Efforts: provider.EffortsOf(m), On: on, Context: m.Context, Max: m.MaxContext, Free: m.Free}
+		images := m.Images || catalog.SeesImages(m.ID)
+		if m.ImageInput != nil {
+			images = *m.ImageInput
+		}
+		images, _ = provider.ApplyImage(p.ID, m.ID, images, m.ImageInput)
+		_, imageSet := provider.ImageOverride(p.ID, m.ID)
+		j := modelJSON{ID: m.ID, Name: m.Name, Efforts: provider.EffortsOf(m), On: on, Context: m.Context, Max: m.MaxContext, Free: m.Free, Images: images, ImageSet: imageSet}
 		if i := slices.IndexFunc(most, func(c catalog.Model) bool { return c.ID == m.ID }); j.Max == 0 && i >= 0 {
 			j.Max = most[i].MaxContext
 		}
@@ -290,8 +373,8 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		out.DrawIDs = append(out.DrawIDs, m.ID)
 	}
 	out.Draws = len(out.DrawIDs)
-	if t, ok := p.Fetched(); ok {
-		out.Fetched = ago(t)
+	if t, ok := p.Listed(); ok {
+		out.Fetched = &t
 	}
 	for _, a := range agents {
 		pa := providerAgent{ID: a.ID, Name: a.Name, Icon: a.Icon, Current: a.pid == p.ID, Model: a.model}
@@ -314,6 +397,7 @@ func providersState() providersJSON {
 	provider.FetchNew(8 * time.Second)
 	agents := agent.Detected()
 	s := providersJSON{Providers: []providerJSON{}, Presets: []presetJSON{}, Excluded: []excludedJSON{}}
+	s.OnPlugins = provider.OnPlugins()
 	for _, x := range provider.Excluded() {
 		e := excludedJSON{Exclusion: x, Name: x.Agent, Icon: "generic"}
 		if a, err := agent.Find(x.Agent); err == nil {
@@ -330,7 +414,8 @@ func providersState() providersJSON {
 		s.Providers = append(s.Providers, providerInfo(p, uses))
 	}
 	for _, pr := range provider.Presets() {
-		s.Presets = append(s.Presets, presetJSON{PresetDef: pr, Added: have[pr.ID]})
+		team := provider.TakesZhipuTeam(provider.Provider{Chat: pr.Chat, Responses: pr.Responses, Anthropic: pr.Anthropic})
+		s.Presets = append(s.Presets, presetJSON{PresetDef: pr, Added: have[pr.ID], ZhipuTeam: team})
 	}
 	cat := provider.Catalog()
 	s.Gateway = gatewayJSON{URL: gateway.URL(), Models: len(cat), Calls: []gateway.Call{}, Groups: []gwGroupJSON{}}
@@ -354,26 +439,37 @@ func providersState() providersJSON {
 	} else {
 		s.Gateway.Running, s.Gateway.Window = gateway.Serving()
 	}
+	s.Gateway.Archive = archiveState()
 	s.CodexDaemon = provider.CodexDaemonStale()
+	s.Plugins = pluginSubs()
 	return s
 }
 
-func ago(t time.Time) string {
-	d := time.Since(t)
-	switch {
-	case d < time.Minute:
-		return "just now"
-	case d < time.Hour:
-		return fmt.Sprintf("%dm ago", int(d.Round(time.Minute).Minutes()))
-	case d < 48*time.Hour:
-		return fmt.Sprintf("%dh ago", int(d.Round(time.Hour).Hours()))
-	default:
-		return t.Format("Jan 2")
-	}
+// failMove is fail with why the move failed, for the page to say it in
+// its reader's language.
+func failMove(rw http.ResponseWriter, err error) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(rw).Encode(map[string]any{"error": err.Error(), "why": provider.WhyOf(err)})
+}
+
+// moveProvider and moveBackProvider are provider.Move and MoveBack, for
+// tests to stand in for.
+var (
+	moveProvider     = provider.Move
+	moveBackProvider = provider.MoveBack
+)
+
+// moveContext keeps a move going though the page that asked for it goes
+// (closed, reloaded): stopped halfway, a move leaves accounts in neither
+// place until it is run again.
+func moveContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
 }
 
 func providerRoutes(mux *http.ServeMux, w Windows) {
 	importAppsRoutes(mux)
+	pluginRoutes(mux, w)
 	traceRoutes(mux)
 	groupRoutes(mux)
 	mux.HandleFunc("GET /api/providers", func(rw http.ResponseWriter, r *http.Request) {
@@ -436,6 +532,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("POST /api/provider/{action}", func(rw http.ResponseWriter, r *http.Request) {
 		var req struct {
 			provider.Provider
+			// Proxy is the proxy its requests go through (#237), "" to
+			// follow the global one; a save that leaves it out keeps it
+			Proxy *string `json:"proxy"`
 			// New is set by the editor's Add: the provider is one more, never
 			// one replacing the provider that has its id or name
 			New bool `json:"new"`
@@ -444,6 +543,10 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			ClearBalanceToken bool `json:"clearBalanceToken"`
 			// From is the id the provider had: another is a rename
 			From string `json:"from"`
+			// CopyOf, with New, is the provider the new one is a copy of
+			// (#268): its key and what else the form doesn't carry are
+			// taken from it when left out
+			CopyOf string `json:"copyOf"`
 			// Model and ModelName, for name: the name the user gives one
 			// of its models, "" for its own again
 			Model     string `json:"model"`
@@ -451,6 +554,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// Efforts, for efforts: the reasoning levels it offers, none
 			// for all it has
 			Efforts []string `json:"efforts"`
+			// Images, for images: whether the model takes images. Nil
+			// gives the vendor's answer back.
+			Images *bool `json:"images"`
 			// Test, for test: models to send a request each, in place of
 			// one per endpoint
 			Test []string `json:"test"`
@@ -468,6 +574,21 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				fail(rw, err)
 				return
 			}
+		case "move":
+			// a built-in subscription's accounts onto its community plugin
+			ctx, cancel := moveContext(r)
+			defer cancel()
+			if err := moveProvider(ctx, in.ID); err != nil {
+				failMove(rw, err)
+				return
+			}
+		case "moveback":
+			ctx, cancel := moveContext(r)
+			defer cancel()
+			if err := moveBackProvider(ctx, in.ID); err != nil {
+				fail(rw, err)
+				return
+			}
 		case "quiet":
 			// a removed account's "Add it back" line, dismissed (#116)
 			if err := provider.QuietAccount(in.ID); err != nil {
@@ -479,6 +600,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// its key when the form left it blank
 			if pr, err := provider.FromPreset(in.Preset); err == nil && in.Chat == "" && in.Responses == "" && in.Anthropic == "" {
 				pr.Key, pr.Models, pr.Fallback, pr.Headers, pr.BalanceToken, pr.Contexts = in.Key, in.Models, in.Fallback, in.Headers, in.BalanceToken, in.Contexts
+				pr.ZhipuTeam = in.ZhipuTeam
+				pr.Searches = in.Searches
 				if in.Name != "" {
 					pr.Name = in.Name
 				}
@@ -496,7 +619,14 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			if req.New {
 				// a second one of a preset, or a name already in use, is
 				// added beside the first under the next free id
-				id, err := provider.Add(in)
+				if req.Proxy != nil {
+					in.Proxy = *req.Proxy
+				}
+				add := provider.Add
+				if req.CopyOf != "" {
+					add = func(p provider.Provider) (string, error) { return provider.AddCopy(p, req.CopyOf) }
+				}
+				id, err := add(in)
 				if err != nil {
 					fail(rw, err)
 					return
@@ -514,6 +644,19 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					in.ID = req.From
 				}
 				old, _ = provider.Find(in.ID)
+				if req.Proxy != nil {
+					in.Proxy = *req.Proxy
+				} else if old != nil {
+					in.Proxy = old.Proxy
+				}
+				// each account's own proxy likewise: {} clears them
+				if in.AccountProxies == nil && old != nil {
+					in.AccountProxies = old.AccountProxies
+				}
+				// a Zhipu key's team likewise: {} clears it
+				if in.ZhipuTeam == nil && old != nil {
+					in.ZhipuTeam = old.ZhipuTeam
+				}
 				if in.Key == "" && old != nil {
 					in.Key = old.Key
 				}
@@ -572,6 +715,11 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			}
 		case "efforts":
 			if err := provider.SetModelEfforts(in.ID+"/"+req.Model, req.Efforts); err != nil {
+				fail(rw, err)
+				return
+			}
+		case "images":
+			if err := provider.SetModelImage(in.ID+"/"+req.Model, req.Images); err != nil {
 				fail(rw, err)
 				return
 			}
@@ -795,12 +943,12 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 	// Adding a subscription: magpie opens the vendor's sign-in in the
 	// browser and the window follows it until the account is in.
 	mux.HandleFunc("POST /api/signin", func(rw http.ResponseWriter, r *http.Request) {
-		var in struct{ Agent string }
+		var in struct{ Agent, Site string } // Site: ZCode's "zai" or "bigmodel"
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			fail(rw, err)
 			return
 		}
-		st, err := provider.StartSignIn(in.Agent)
+		st, err := provider.StartSignInAt(in.Agent, in.Site)
 		if err != nil {
 			fail(rw, err)
 			return
@@ -822,6 +970,18 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 	})
 	mux.HandleFunc("POST /api/signin/{id}/cancel", func(rw http.ResponseWriter, r *http.Request) {
 		provider.CancelSignIn(r.PathValue("id"))
+		rw.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /api/signin/{id}/callback", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ URL string }
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SubmitSignInCallback(r.PathValue("id"), in.URL); err != nil {
+			fail(rw, err)
+			return
+		}
 		rw.WriteHeader(http.StatusNoContent)
 	})
 	// Accounts brought in from another tool's export (Antigravity's, from

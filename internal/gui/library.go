@@ -23,6 +23,9 @@ type libraryJSON struct {
 	*library.View
 	Result *library.Result `json:"result,omitempty"`
 	Home   string          `json:"home"` // for the page to show paths under it as ~
+	// Problems are every one still standing, the page's list of what an
+	// agent couldn't be given: not only those a chip can carry
+	Problems []library.Problem `json:"problems,omitempty"`
 }
 
 func libraryView(res *library.Result) (libraryJSON, error) {
@@ -34,7 +37,7 @@ func libraryView(res *library.Result) (libraryJSON, error) {
 	lastProblems.Unlock()
 	v, err := library.Read(p)
 	home, _ := os.UserHomeDir()
-	return libraryJSON{View: v, Result: res, Home: home}, err
+	return libraryJSON{View: v, Result: res, Home: home, Problems: p}, err
 }
 
 // marketJSON is a market's list, and why it may be short: a search that
@@ -65,7 +68,7 @@ func revealable(v *library.View) []string {
 		}
 	}
 	for _, s := range v.FoundSkills {
-		out = append(out, s.Link)
+		out = append(out, s.Link, s.Shared)
 	}
 	for _, p := range v.Projects {
 		out = append(out, p.Dir)
@@ -253,8 +256,9 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			Agents []string `json:"agents"`
 			Source string
 			Paths  []string
-			Names  []string // the skills to update, of those a check found changed
+			Names  []string // the skills to update, of those a check found changed; to bring in, of those found in the agents
 			Server library.Server
+			Agent  string            // the agent whose own skill is in the library's way
 			ID     string            // a market server's, or a market skill's in its repository
 			Values map[string]string // what a market server needs
 			Dir    string            // a project's folder
@@ -296,6 +300,12 @@ func libraryRoutes(mux *http.ServeMux, w Windows) {
 			res, err = library.RemoveSkill(in.Name)
 		case "skills/import":
 			res, err = library.ImportSkill(in.Name)
+		case "skills/import-all":
+			res, err = library.ImportSkills(in.Names)
+		case "skills/use-library":
+			res, err = library.UseLibrarySkill(in.Name, in.Agent)
+		case "skills/keep-own":
+			res, err = library.KeepAgentSkill(in.Name, in.Agent)
 		case "market/server":
 			res, err = library.InstallServer(in.ID, in.Values, in.Agents)
 		case "market/skill":

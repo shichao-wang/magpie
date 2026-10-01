@@ -265,19 +265,30 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		}
 		// a model that draws is kept, marked, for Settings → Images; any
 		// other that isn't for text (embeddings, speech) is left out
-		drawer := DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research")
+		drawer := DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research") || r.Kind == "image"
 		if !drawer && !textModel(mdModel{ID: id}) {
 			continue
 		}
 		name := r.DisplayName
+		if r.Label != "" {
+			name = r.Label
+		}
 		if name == "" {
 			name = id
 		}
 		input := imageInput(r.Modalities.Input)
-		m := Model{ID: id, Name: name, ImageInput: input, APIs: EndpointAPIs(r.Endpoints), Draws: drawer}
+		apis := EndpointAPIs(r.Endpoints)
+		if native := EndpointAPIs(r.Native); len(native) > 0 {
+			apis = native
+		}
+		m := Model{ID: id, Name: name, ImageInput: input, APIs: apis, Draws: drawer}
 		if n, ok := r.ContextLength.(float64); ok && n > 0 {
 			m.Context = int(n)
 		}
+		if n, ok := r.Output.(float64); ok && n > 0 {
+			m.Output = int(n)
+		}
+		m.Efforts = levelsOf(r.Levels)
 		if input != nil {
 			m.Images = *input
 		}
@@ -327,6 +338,35 @@ type liveModel struct {
 	// the context window, where the list tells it (OpenRouter, Command
 	// Code); any, as a vendor's odd value mustn't lose the whole list
 	ContextLength any `json:"context_length"`
+	// what another magpie's list tells of each model: the APIs its own
+	// provider serves it on, where a request goes on as it is rather
+	// than translated (native_endpoints), its longest reply and its
+	// reasoning levels. any, as a vendor's odd value mustn't lose the
+	// whole list
+	Native []string `json:"native_endpoints"`
+	Output any      `json:"max_output_tokens"`
+	Levels any      `json:"supported_reasoning_levels"`
+	// another magpie's name for the model with its provider there after
+	// it, and "image" on one it draws with
+	Label string `json:"magpie_label"`
+	Kind  string `json:"kind"`
+}
+
+// levelsOf are the efforts of a list's supported_reasoning_levels, as
+// magpie and Codex write them ([{"effort":"high"}]) or as plain names.
+func levelsOf(v any) []string {
+	xs, _ := v.([]any)
+	var out []string
+	for _, x := range xs {
+		e, _ := x.(string)
+		if o, ok := x.(map[string]any); ok {
+			e, _ = o["effort"].(string)
+		}
+		if e != "" && !slices.Contains(out, e) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // EndpointAPIs names the APIs of a model list's supported_endpoints —
@@ -369,6 +409,7 @@ func Decorate(live []Model, known []Model) []Model {
 				m.Name = k.Name
 			}
 			m.Efforts, m.Released, m.Provider = k.Efforts, k.Released, k.Provider
+			m.Reasoning = m.Reasoning || k.Reasoning
 			if m.ImageInput == nil {
 				m.ImageInput = k.ImageInput
 				m.Images = m.Images || k.Images

@@ -25,6 +25,34 @@ import (
 type ResetCredits struct {
 	Count int        `json:"count"`
 	Until *time.Time `json:"until,omitempty"`
+	// ByWindow: each reset is for one window, FiveHour of the five hours'
+	// and Weekly of the week's, and is spent on the vendor's own page (a
+	// GLM Coding team plan's, zcode_team.go), not from magpie
+	ByWindow bool `json:"byWindow,omitempty"`
+	FiveHour int  `json:"fiveHour,omitempty"`
+	Weekly   int  `json:"weekly,omitempty"`
+}
+
+// Words are the resets counted: "2 resets", or by window, "2 five-hour
+// resets · 1 weekly reset".
+func (r ResetCredits) Words() string {
+	n := func(c int, unit string) string {
+		if c == 1 {
+			return "1 " + unit
+		}
+		return fmt.Sprintf("%d %ss", c, unit)
+	}
+	if !r.ByWindow {
+		return n(r.Count, "reset")
+	}
+	var out []string
+	if r.FiveHour > 0 {
+		out = append(out, n(r.FiveHour, "five-hour reset"))
+	}
+	if r.Weekly > 0 {
+		out = append(out, n(r.Weekly, "weekly reset"))
+	}
+	return strings.Join(out, " · ")
 }
 
 // codexResetDetailsTimeout bounds the second look, at when the resets run
@@ -88,8 +116,9 @@ func codexResets(ctx context.Context, base, token, accountID string, count int) 
 }
 
 // ResetOutcome is what spending a reset did: Code is the vendor's word for
-// it (reset, nothing_to_reset, no_credit, already_redeemed) and Windows
-// how many windows started again.
+// it (reset, nothing_to_reset, no_credit, already_redeemed; for Claude
+// already_used, not_limited, cooldown, ineligible, unavailable too) and
+// Windows how many windows started again.
 type ResetOutcome struct {
 	Code    string `json:"code"`
 	Windows int    `json:"windows"`
@@ -107,7 +136,7 @@ func (o ResetOutcome) Text() string {
 		return "nothing to reset — no window has been used, and the reset is kept"
 	case "no_credit":
 		return "no reset left on the account"
-	case "already_redeemed":
+	case "already_redeemed", "already_used":
 		return "that reset was already used"
 	}
 	return o.Code
@@ -119,10 +148,11 @@ func (o ResetOutcome) Text() string {
 // last longer goes before it. It can't be undone: callers ask first. The
 // account's usage is read afresh after.
 func UseCodexReset(ctx context.Context, user string) (ResetOutcome, error) {
-	user, tok, accountID, err := codexUserToken(ctx, user)
+	user, tok, accountID, err := codexUserToken(ViaLogin(ctx, "codex", user), user)
 	if err != nil {
 		return ResetOutcome{}, err
 	}
+	ctx = ViaLogin(ctx, "codex", user) // through the account's own proxy
 	base := strings.TrimSuffix(CodexBase, "/codex")
 	// which of them to spend is named, as Codex itself does: left to the
 	// vendor, it may be one that lasts longer

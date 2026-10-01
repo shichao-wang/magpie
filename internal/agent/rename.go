@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -8,7 +9,8 @@ import (
 
 // RenameProvider gives a provider another id (provider.Rename) and moves
 // the agents on one of its models to the same model by the new id, each
-// spelled the way the agent spells it. It answers the agents it moved.
+// spelled the way the agent spells it, and what else in their configs names
+// it (RenameRefs). It answers the agents it moved.
 func RenameProvider(from, to string) ([]string, error) {
 	from = strings.ToLower(strings.TrimSpace(from))
 	to = strings.ToLower(strings.TrimSpace(to))
@@ -27,12 +29,19 @@ func RenameProvider(from, to string) ([]string, error) {
 				if v == "" {
 					continue
 				}
+				// the agent's suffix after the model (SplitSuffix) stays; a
+				// list of models is the user's own, its names moved by
+				// RenameRefs where the agent has one
+				model, suffix, one := a.split(v)
+				if !one {
+					continue
+				}
 				nv := ""
 				if f.Options != nil {
 					for _, o := range f.Options(vals) {
-						if o.Value == v && strings.HasPrefix(o.Ref, from+"/") {
+						if o.Value == model && strings.HasPrefix(o.Ref, from+"/") {
 							now := to + "/" + strings.TrimPrefix(o.Ref, from+"/")
-							nv = strings.Replace(v, o.Ref, now, 1)
+							nv = strings.Replace(model, o.Ref, now, 1) + suffix
 							break
 						}
 					}
@@ -56,6 +65,20 @@ func RenameProvider(from, to string) ([]string, error) {
 		}
 		if len(moved) == 0 || moved[len(moved)-1] != m.a.Name {
 			moved = append(moved, m.a.Name)
+		}
+	}
+	if from != to {
+		for _, a := range Detected() {
+			if a.RenameRefs == nil {
+				continue
+			}
+			ok, err := a.RenameRefs(from, to)
+			if err != nil {
+				return moved, err
+			}
+			if ok && !slices.Contains(moved, a.Name) {
+				moved = append(moved, a.Name)
+			}
 		}
 	}
 	SyncCatalog()

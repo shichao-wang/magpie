@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -136,4 +137,108 @@ func TestClaudeDesktopKnown(t *testing.T) {
 			t.Errorf("%q %q: %s", c.key, c.ua, got)
 		}
 	}
+}
+
+func TestClaudeDesktopTierModels(t *testing.T) {
+	setup(t, provider.Anthropic, &fake{})
+	before := DesktopTiers
+	DesktopTiers = func() map[string]string {
+		return map[string]string{"opus": "fake/m1", "sonnet": "fake/m1", "haiku": "fake/m1", "fable": "fake/m1"}
+	}
+	t.Cleanup(func() { DesktopTiers = before })
+	models := desktopTierModels()
+	want := []string{"claude-opus-magpie", "claude-sonnet-magpie", "claude-haiku-magpie", "magpie-tier-fable"}
+	got := make([]string, 0, len(models))
+	for _, model := range models {
+		got = append(got, model["id"].(string))
+		if !desktopAccepts(model["id"].(string)) {
+			t.Errorf("Desktop would drop tier %q", model["id"])
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Desktop models = %v, want %v", got, want)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("x-api-key", Token+"-claude-desktop")
+	New().Handler().ServeHTTP(rec, req)
+	var list struct {
+		Data []struct{ ID string } `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	got = got[:0]
+	for _, model := range list.Data {
+		got = append(got, model.ID)
+	}
+	if !reflect.DeepEqual(got, append([]string{aliasFor("fake/m1")}, want...)) {
+		t.Fatalf("Claude Desktop list = %v, want %v", got, want)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("x-api-key", TokenFor("claude"))
+	New().Handler().ServeHTTP(rec, req)
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Data) != 1 || list.Data[0].ID != "fake/m1" {
+		t.Fatalf("another agent's list: %s", rec.Body)
+	}
+	for _, id := range want {
+		rec = httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/v1/models/"+id, nil)
+		req.Header.Set("x-api-key", Token+"-claude-desktop")
+		New().Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"`+id+`"`) {
+			t.Errorf("GET /v1/models/%s: %d %s", id, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestClaudeDesktopTierNames(t *testing.T) {
+	setup(t, provider.Anthropic, &fake{})
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Anthropic: "http://127.0.0.1:1", Models: []string{"m1", "m2"}}); err != nil {
+		t.Fatal(err)
+	}
+	chosen := map[string]string{"opus": "fake/m2", "sonnet": "fake/m2", "fable": "fake/unlisted"}
+	before := StandIn
+	StandIn = func(agent, model string) string {
+		if agent == "claude-desktop" {
+			return chosen[DesktopTier(model)]
+		}
+		return ""
+	}
+	t.Cleanup(func() { StandIn = before })
+	check := func(want []string) {
+		t.Helper()
+		models := desktopTierModels()
+		var names []string
+		for _, model := range models {
+			names = append(names, model["display_name"].(string))
+			req := httptest.NewRequest("GET", "/v1/models/"+model["id"].(string), nil)
+			req.Header.Set("x-api-key", TokenFor("claude-desktop"))
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, req)
+			var got map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != 200 || got["display_name"] != model["display_name"] || got["description"] != model["description"] {
+				t.Fatalf("single tier disagrees with list: %s", rec.Body)
+			}
+		}
+		if !reflect.DeepEqual(names, want) {
+			t.Fatalf("tier names = %v, want %v", names, want)
+		}
+	}
+	check([]string{"m2 · Opus", "m2 · Sonnet", "fake/unlisted · Fable"})
+	chosen["opus"] = "fake/m1"
+	delete(chosen, "sonnet")
+	check([]string{"m1 · Opus", "fake/unlisted · Fable"})
+	if err := provider.SetModelName("fake/m1", "My model"); err != nil {
+		t.Fatal(err)
+	}
+	check([]string{"My model · Opus", "fake/unlisted · Fable"})
 }

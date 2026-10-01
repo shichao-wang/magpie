@@ -10,6 +10,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -165,9 +167,9 @@ func grokAccount() (Provider, bool) {
 		if err != nil {
 			return nil, err
 		}
-		return ms, catalog.SaveLive("grok", grokBase, ms)
+		return ms, catalog.SaveLive("grok", GrokBase, ms)
 	}
-	return Provider{ID: "grok", Name: "Grok (SuperGrok)", Icon: "xai", Website: "https://x.ai/cli", Responses: grokBase, Account: acct}, true
+	return Provider{ID: "grok", Name: "Grok (SuperGrok)", Icon: "xai", Website: "https://x.ai/cli", Responses: GrokBase, Account: acct}, true
 }
 
 // grokSigned has the account's requests signed with the sign-in in home.
@@ -193,7 +195,8 @@ func grokSigned(acct *Account, home string) {
 
 // grokTools are the tool types Grok's backend takes; it turns the whole
 // request away over another, as over Codex's freeform apply_patch (custom)
-// or its sub-agent tools, grouped in a namespace.
+// or a namespace, which groups its sub-agent tools. A namespace's functions
+// go as functions of their own (grokFlat).
 var grokTools = map[string]bool{"function": true, "web_search": true, "x_search": true, "image_generation": true,
 	"collections_search": true, "file_search": true, "code_execution": true, "code_interpreter": true,
 	"mcp": true, "shell": true, "tool_search": true}
@@ -204,9 +207,15 @@ var grokTools = map[string]bool{"function": true, "web_search": true, "x_search"
 // reach the live web, which Grok's doesn't take either; it searches live.
 // And Codex hands reasoning back with "content": null, which the backend
 // can't read the encrypted reasoning beside ("Could not decode the
-// compaction blob"), so a null content goes.
+// compaction blob"), so a null content goes. A namespace's functions, as
+// collaboration's spawn_agent, go flat (collaboration__spawn_agent), and so
+// do the calls to them handed back and a tool_choice naming one (#404).
+// A tool_choice with no tools
+// left goes too: the backend turns the request away over it ("A
+// tool_choice was set on the request but no tools were specified"), as it
+// would Codex's compaction summary, sent without tools (#378).
 func grokBody(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) {
+	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`"tool_choice"`)) && !bytes.Contains(body, []byte(`"namespace"`)) {
 		return body
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -221,6 +230,11 @@ func grokBody(body []byte) []byte {
 		for _, t := range tools {
 			if tm, ok := t.(map[string]any); ok {
 				ty, _ := tm["type"].(string)
+				if ty == "namespace" {
+					dirty = true
+					kept = append(kept, grokFlat(tm)...)
+					continue
+				}
 				if !grokTools[ty] {
 					dirty = true
 					continue
@@ -234,14 +248,26 @@ func grokBody(body []byte) []byte {
 		}
 		m["tools"] = kept
 		if tc, ok := m["tool_choice"].(map[string]any); ok {
+			if flatCall(tc) {
+				dirty = true
+			}
 			if ty, _ := tc["type"].(string); !grokTools[ty] {
 				delete(m, "tool_choice")
 				dirty = true
 			}
 		}
 	}
+	if tools, _ := m["tools"].([]any); len(tools) == 0 {
+		if _, ok := m["tool_choice"]; ok {
+			delete(m, "tool_choice")
+			dirty = true
+		}
+	}
 	input, _ := m["input"].([]any)
 	for _, it := range input {
+		if im, ok := it.(map[string]any); ok && flatCall(im) {
+			dirty = true
+		}
 		if im, ok := it.(map[string]any); ok && im["type"] == "reasoning" {
 			if c, ok := im["content"]; ok && c == nil {
 				delete(im, "content")
@@ -257,6 +283,57 @@ func grokBody(body []byte) []byte {
 		return body
 	}
 	return b
+}
+
+// liteNamespace is the namespace Codex's Responses Lite groups its own
+// functions in, which Codex reads as none at all.
+const liteNamespace = "functions"
+
+// FlatName is the name a namespaced tool is offered to a model under, which
+// takes one flat name: namespace__name, as Codex names an MCP server's tools.
+// A name longer than the 64 characters APIs allow is cut and made unique by
+// a hash of the whole.
+func FlatName(namespace, name string) string {
+	flat := namespace + "__" + name
+	if len(flat) <= 64 {
+		return flat
+	}
+	sum := sha256.Sum256([]byte(namespace + "\x00" + name))
+	return flat[:55] + "_" + hex.EncodeToString(sum[:4])
+}
+
+// grokFlat is a namespace's functions, each under its flat name; what else
+// it holds, a freeform tool, Grok's backend wouldn't take either.
+func grokFlat(ns map[string]any) []any {
+	space, _ := ns["name"].(string)
+	nested, _ := ns["tools"].([]any)
+	var out []any
+	for _, n := range nested {
+		nm, _ := n.(map[string]any)
+		name, _ := nm["name"].(string)
+		if nm == nil || nm["type"] != "function" || name == "" {
+			continue
+		}
+		if space != "" && space != liteNamespace {
+			nm["name"] = FlatName(space, name)
+		}
+		out = append(out, nm)
+	}
+	return out
+}
+
+// flatCall names a call to a namespaced tool, or a tool_choice of one, by
+// the flat name it was offered under, and reports whether it was one.
+func flatCall(it map[string]any) bool {
+	space, ok := it["namespace"].(string)
+	if !ok {
+		return false
+	}
+	delete(it, "namespace")
+	if name, _ := it["name"].(string); name != "" && space != "" && space != liteNamespace {
+		it["name"] = FlatName(space, name)
+	}
+	return true
 }
 
 // grokHeaders say a request comes from the Grok CLI, which the backend
@@ -316,7 +393,7 @@ func grokVersion() string {
 // grokModels lists what the account can use, with each model's context
 // window and efforts, as the CLI's backend lists them.
 func grokModels(ctx context.Context, sign func(context.Context, *http.Request, []byte) error) ([]catalog.Model, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, grokBase+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, GrokBase+"/models", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -438,7 +515,7 @@ func startGrokSignIn(s *signInFlow) error {
 		return runCLISignIn(s, "grok login", nil, true, nil, func() (string, string, bool) {
 			c, ok := readGrokCredential(GrokHome())
 			return c.Email, "", ok
-		}, path, "login", "--device-auth")
+		}, nil, path, "login", "--device-auth")
 	}
 	home, err := newGrokHome()
 	if err != nil {
@@ -447,7 +524,7 @@ func startGrokSignIn(s *signInFlow) error {
 	err = runCLISignIn(s, "grok login", grokOwnEnv(os.Environ(), home), false, func() { removeGrokHome(home) }, func() (string, string, bool) {
 		user, err := addGrokLogin(home)
 		return user, "", err == nil
-	}, path, "login", "--device-auth")
+	}, nil, path, "login", "--device-auth")
 	if err != nil {
 		removeGrokHome(home)
 	}
@@ -465,8 +542,10 @@ func agentCommand(ctx context.Context, path string, args ...string) *exec.Cmd {
 // prints to the window, and finishes when the command does and identity
 // says who is signed in. using says whether the agent now uses that
 // account; failed, when there is one, undoes what a sign-in that did not
-// finish left behind.
-func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed func(), identity func() (user, plan string, ok bool), path string, args ...string) error {
+// finish left behind. whole, when there is one, says a link has all it
+// needs: one that hasn't is the start of a link the CLI wrapped, and the
+// lines after it that are nothing but more of it are joined on.
+func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed func(), identity func() (user, plan string, ok bool), whole func(link string) bool, path string, args ...string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := proc.CommandContext(ctx, path, args...)
 	cmd.Dir, _ = os.UserHomeDir()
@@ -485,20 +564,52 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 	s.stop = cancel
 	s.mu.Unlock()
 	got := make(chan string, 1)
+	var partial struct {
+		sync.Mutex
+		link string
+	}
 	go func() {
-		sc := bufio.NewScanner(out)
+		rd := bufio.NewReader(out)
 		sent := false
-		var tail []string
-		for sc.Scan() {
-			line := ansi.ReplaceAllString(sc.Text(), "")
-			if u := cursorLoginURL.FindString(line); u != "" && !sent {
+		link := ""
+		send := func() {
+			if !sent && link != "" {
 				sent = true
-				got <- u
+				got <- link
+			}
+		}
+		var tail []string
+		for {
+			raw, rerr := rd.ReadString('\n')
+			line := ansi.ReplaceAllString(strings.TrimRight(raw, "\r\n"), "")
+			switch {
+			case sent:
+			case link == "":
+				link = cursorLoginURL.FindString(line)
+			case linkRest.MatchString(strings.TrimSpace(line)) && (!whole(link) || queryRest.MatchString(strings.TrimSpace(line))):
+				// a whole link takes only more of its query, not "Waiting..." printed after it
+				link += strings.TrimSpace(line)
+			default:
+				send() // what came after it isn't more of it
+			}
+			// a whole link is handed on once what came with it is read,
+			// so the rest of one wrapped after its last param joins too
+			if whole == nil || whole(link) && rd.Buffered() == 0 {
+				send()
+			}
+			if !sent {
+				partial.Lock()
+				partial.link = link
+				partial.Unlock()
 			}
 			if strings.TrimSpace(line) != "" {
 				tail = append(tail, strings.TrimSpace(line))
 			}
+			if rerr != nil {
+				break
+			}
 		}
+		send()
 		if !sent {
 			close(got)
 		}
@@ -520,20 +631,39 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 		}
 		s.finish(SignInState{State: "failed", Error: msg})
 	}()
+	var u string
 	select {
-	case u, ok := <-got:
+	case l, ok := <-got:
 		if !ok {
 			return fmt.Errorf("%s gave no link to open", what)
 		}
-		s.mu.Lock()
-		s.st.URL = u
-		s.mu.Unlock()
-		return nil
-	case <-time.After(30 * time.Second):
-		cancel()
-		return fmt.Errorf("%s gave no link to open", what)
+		u = l
+	case <-time.After(linkWait):
+		// a link that never came whole is still the one there is
+		partial.Lock()
+		u = partial.link
+		partial.Unlock()
+		if u == "" {
+			cancel()
+			return fmt.Errorf("%s gave no link to open", what)
+		}
 	}
+	s.mu.Lock()
+	s.st.URL = u
+	s.mu.Unlock()
+	return nil
 }
+
+// linkWait is how long a login command has to print its link.
+var linkWait = 30 * time.Second
+
+// linkRest is a line that is nothing but more of a link: no spaces, only
+// what a URL holds.
+var linkRest = regexp.MustCompile(`^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$`)
+
+// queryRest is what may still follow a link that already has its challenge
+// and uuid: the rest of a value, or more params.
+var queryRest = regexp.MustCompile(`^[A-Za-z0-9\-_%&=]+$`)
 
 // GrokUser is who the grok with this home is signed in to.
 func GrokUser(home string) (string, bool) {

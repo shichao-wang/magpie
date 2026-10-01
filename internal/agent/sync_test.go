@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
+	"gopkg.in/yaml.v3"
 )
 
 // syncHome is a sandbox home with a models.dev catalog that knows glm-4.6's
@@ -26,8 +28,15 @@ func syncHome(t *testing.T) string {
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
 	t.Setenv("HERMES_HOME", "")
+	t.Setenv("MIMOCODE_HOME", "")
 	t.Setenv("HANA_HOME", "")
 	t.Setenv("DSH_HOME", "")
+	t.Setenv("OMO_CODING_AGENT_DIR", "")
+	t.Setenv("SENPI_CODING_AGENT_DIR", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("PI_CONFIG_DIR", "")
+	t.Setenv("OMP_PROFILE", "")
+	t.Setenv("PI_PROFILE", "")
 	noKeychain(t)
 	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
 	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800}}}}}`), 0o644)
@@ -96,6 +105,88 @@ func TestPiModelsCarryMaxTokens(t *testing.T) {
 	}
 }
 
+// Crush is handed how long a reply may be beside the window it is handed
+// with it: without it Crush caps every model at 16384 tokens, one the
+// catalogue says can write far more of them included. A model whose output
+// isn't known keeps Crush's own default.
+func TestCrushModelsCarryMaxTokens(t *testing.T) {
+	syncHome(t)
+	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800,"output":131072}}}}}`), 0o644)
+	catalog.Reset()
+	b, _ := json.Marshal(magpieProviderJSON("crush"))
+	if !strings.Contains(string(b), `"id":"relay/glm-4.6"`) || !strings.Contains(string(b), `"context_window":204800`) ||
+		!strings.Contains(string(b), `"default_max_tokens":131072`) {
+		t.Fatalf("%s", b)
+	}
+
+	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800}}}}}`), 0o644)
+	catalog.Reset()
+	b, _ = json.Marshal(magpieProviderJSON("crush"))
+	if !strings.Contains(string(b), `"default_max_tokens":16384`) {
+		t.Fatalf("unknown output took Crush's default away: %s", b)
+	}
+}
+
+// An output limit above the model's window (models.dev lists deepseek-chat's
+// 384000 against 128000 of context) is cut to the window for every agent
+// magpie hands an output limit; one whose window isn't known keeps its
+// output. ZCode and WorkBuddy cap it at zcodeMaxOutput besides, Crush falls
+// back to 16384 without a known output, and OpenCode is handed no limit
+// without a window.
+func TestMaxTokensWithinContextWindow(t *testing.T) {
+	home := syncHome(t)
+	check := func(limit string, want int) {
+		t.Helper()
+		os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{`+limit+`}}}}}`), 0o644)
+		catalog.Reset()
+		pi, _ := json.Marshal(magpieProviderJSON("pi"))
+		cline, _ := json.Marshal(clineModels(""))
+		omp, _ := yaml.Marshal(ompProvider())
+		dshRoute, _ := yaml.Marshal(dshRouteConfig())
+		droid, _ := json.Marshal(droidEntries())
+		qoder, _ := json.Marshal(qoderProvider("qoder", ""))
+		hanako, _ := json.Marshal(hanakoProvider())
+		opencode, _ := json.Marshal(magpieProviderJSON("opencode"))
+		zc, _ := json.Marshal(zcodeProviderJSON(filepath.Join(home, "none.json")))
+		crush, _ := json.Marshal(magpieProviderJSON("crush"))
+		rules, wb := filepath.Join(t.TempDir(), "provider_config.json"), filepath.Join(t.TempDir(), "models.json")
+		if err := zcodeRules(rules, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := workbuddyWrite(wb, true); err != nil {
+			t.Fatal(err)
+		}
+		zcRules, _ := os.ReadFile(rules)
+		wbModels, _ := os.ReadFile(wb)
+		n, capped := strconv.Itoa(want), strconv.Itoa(min(want, zcodeMaxOutput))
+		wants := map[string][2]string{
+			"pi":          {string(pi), `"maxTokens":` + n},
+			"cline":       {string(cline), `"maxTokens":` + n},
+			"omp":         {string(omp), "maxTokens: " + n},
+			"dsh":         {string(dshRoute), "maxTokens: " + n},
+			"droid":       {string(droid), `"maxOutputTokens":` + n},
+			"qoder":       {string(qoder), `"maxOutputTokens":` + n},
+			"hanako":      {string(hanako), `"maxOutput":` + n},
+			"zcode":       {string(zc), `"output":` + capped},
+			"crush":       {string(crush), `"default_max_tokens":` + n},
+			"zcode rules": {string(zcRules), `"max":` + capped},
+			"workbuddy":   {string(wbModels), `"maxOutputTokens": ` + capped},
+		}
+		if strings.Contains(limit, "context") {
+			wants["opencode"] = [2]string{string(opencode), `"output":` + n}
+		}
+		for agent, w := range wants {
+			if !strings.Contains(w[0], w[1]) {
+				t.Errorf("%s: want %s in %s", agent, w[1], w[0])
+			}
+		}
+	}
+	check(`"context":128000,"output":384000`, 128000)
+	check(`"output":384000`, 384000)
+	check(`"context":204800,"output":131072`, 131072)
+	check(`"context":64000,"output":384000`, 64000)
+}
+
 // A provider added after a magpie model was picked reaches the lists agents
 // keep of magpie's models; a file magpie wrote nothing into stays as it is.
 func TestSyncCatalogRewritesAgentLists(t *testing.T) {
@@ -144,6 +235,7 @@ func TestSyncCatalogRewritesAgentLists(t *testing.T) {
 func TestSyncCatalogAgesCodexCache(t *testing.T) {
 	home := syncHome(t)
 	dir := filepath.Join(home, ".codex")
+	writeFile(t, filepath.Join(dir, "auth.json"), `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`)
 	writeFile(t, filepath.Join(dir, "config.toml"), "model = \"relay/glm-4.6\"\nopenai_base_url = \""+codexGatewayURL()+"\"\n")
 	cache := filepath.Join(dir, "models_cache.json")
 	writeFile(t, cache, `{"fetched_at":"2026-09-25T10:00:00Z","etag":"W/\"v1\"","client_version":"0.155.1","models":[{"slug":"gpt-5.5"}]}`)
@@ -259,6 +351,42 @@ func TestMiMoCodeMirrorsOpenCode(t *testing.T) {
 	}
 	if s := readFile(cfg); s != body {
 		t.Fatalf("%s", s)
+	}
+}
+
+// Xiaomi MiMo, the desktop app, runs MiMo Code's engine and reads its config
+// as it does (#249): the first of mimocode.jsonc, mimocode.json and
+// config.json there is, in $MIMOCODE_HOME/config when that is set.
+func TestMiMoCodeConfigAsTheAppFindsIt(t *testing.T) {
+	home := syncHome(t)
+	plain := filepath.Join(home, ".config", "mimocode", "config.json")
+	writeFile(t, plain, `{"model":"magpie/relay/glm-4.6","provider":{"mine":{"name":"mine"}}}`)
+	a := mimocode(home, filepath.Join(home, ".config"))
+	if a.Path != plain {
+		t.Fatalf("config at %s, want %s", a.Path, plain)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if s := readFile(plain); !strings.Contains(s, `"magpie"`) || !strings.Contains(s, `"mine"`) {
+		t.Fatalf("%s", s)
+	}
+	// its own name comes first
+	own := filepath.Join(home, ".config", "mimocode", "mimocode.json")
+	writeFile(t, own, `{}`)
+	if a := mimocode(home, filepath.Join(home, ".config")); a.Path != own {
+		t.Fatalf("config at %s, want %s", a.Path, own)
+	}
+
+	moved := filepath.Join(home, "mimo-home")
+	t.Setenv("MIMOCODE_HOME", moved)
+	if a := mimocode(home, filepath.Join(home, ".config")); a.Path != filepath.Join(moved, "config", "mimocode.json") {
+		t.Fatalf("with MIMOCODE_HOME, config at %s", a.Path)
+	}
+	// a relative one is refused by the app, and ignored here
+	t.Setenv("MIMOCODE_HOME", "mimo-home")
+	if a := mimocode(home, filepath.Join(home, ".config")); a.Path != own {
+		t.Fatalf("with a relative MIMOCODE_HOME, config at %s", a.Path)
 	}
 }
 

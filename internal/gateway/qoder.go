@@ -41,12 +41,13 @@ var (
 const qoderSys = "You are a Qoder agent. Use the instructions below and the tools available to you to assist the user."
 
 // qoderAuth hands a request the signed-in account's uid and a live job
-// token, and qoderURL the chat endpoint; vars so tests can stand in for
-// them, the way a Devin round stands in for devinAuth.
+// token, and qoderURL the chat endpoint on the credential's site (qoder.com's
+// or Qoder CN's); vars so tests can stand in for them, the way a Devin round
+// stands in for devinAuth.
 var (
-	qoderAuth  = provider.QoderCredential
-	qoderModel = provider.QoderModel
-	qoderURL   = qoder.ChatURL
+	qoderAuth  = provider.QoderCredentialOf
+	qoderModel = provider.QoderModelOf
+	qoderURL   = func(c *qoder.Credential) string { return c.OnSite().ChatURL() }
 )
 
 // serveQoder answers a request through Qoder's API.
@@ -56,7 +57,7 @@ func (s *Server) serveQoder(w http.ResponseWriter, r *http.Request, from provide
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
 	req.Model = model
-	ask := s.askQoder(model, p.Account.User)
+	ask := s.askQoder(p.Account.Agent, model, p.Account.User)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	q := req
@@ -89,8 +90,14 @@ func (s *Server) serveQoder(w http.ResponseWriter, r *http.Request, from provide
 
 // relayQoder preserves upstream failures before committing a response, including
 // failures after partial non-streaming text. Streaming failures after output
-// has begun are terminal error events. Keep this policy local to Qoder.
+// has begun are terminal error events. Keep this policy to the backends that
+// report their own statuses: Qoder's, and Zed's (relayStatus).
 func relayQoder(w http.ResponseWriter, from provider.Protocol, req *Request, events <-chan Event, usage *Usage, abort context.CancelFunc) (int, string) {
+	return relayStatus(w, from, "Qoder", req, events, usage, abort)
+}
+
+// relayStatus is relayQoder for the backend called name.
+func relayStatus(w http.ResponseWriter, from provider.Protocol, name string, req *Request, events <-chan Event, usage *Usage, abort context.CancelFunc) (int, string) {
 	fail := func(ev Event) (int, string) {
 		abort()
 		code := ev.Status
@@ -111,7 +118,7 @@ func relayQoder(w http.ResponseWriter, from provider.Protocol, req *Request, eve
 			}
 		}
 		if len(head) == 0 || head[len(head)-1].Kind == KStart || head[len(head)-1].Kind == KUsage {
-			return fail(Event{Text: "Qoder ended without an answer"})
+			return fail(Event{Text: name + " ended without an answer"})
 		}
 		enc := encoder(from, newSSEWriter(w), req)
 		see := func(ev Event) bool {
@@ -148,10 +155,11 @@ func relayQoder(w http.ResponseWriter, from provider.Protocol, req *Request, eve
 	return 200, ""
 }
 
-// askQoder is a round for Qoder's API.
-func (s *Server) askQoder(model, user string) round {
+// askQoder is a round for Qoder's API, on the site agent ("qoder" or
+// "qoder-cn") names.
+func (s *Server) askQoder(agent, model, user string) round {
 	return func(ctx context.Context, req *Request) (<-chan Event, int, string) {
-		cred, err := qoderAuth(ctx, user)
+		cred, err := qoderAuth(ctx, agent, user)
 		if err != nil {
 			// only a sign-in that is gone asks the agent to log in again;
 			// a refresh that timed out or never reached Qoder may pass
@@ -161,7 +169,7 @@ func (s *Server) askQoder(model, user string) round {
 			}
 			return nil, status, "Qoder: " + err.Error()
 		}
-		config, err := qoderModel(ctx, user, model)
+		config, err := qoderModel(ctx, agent, user, model)
 		if err != nil {
 			return nil, 400, err.Error()
 		}
@@ -171,12 +179,13 @@ func (s *Server) askQoder(model, user string) round {
 		}
 		wire := qoder.EncodeRequestBody(plain)
 		ts := time.Now().Unix()
-		headers, err := qoder.BuildCosyHeaders(qoderURL(), &qoder.User{UID: cred.UID, Token: cred.Token,
+		chat := qoderURL(cred)
+		headers, err := qoder.BuildCosyHeaders(chat, &qoder.User{UID: cred.UID, Token: cred.Token,
 			Name: cred.Name, Email: cred.Email, MachineID: cred.MachineID}, wire, ts)
 		if err != nil {
 			return nil, 500, "Qoder: " + err.Error()
 		}
-		hr, err := http.NewRequestWithContext(ctx, http.MethodPost, qoderURL(), strings.NewReader(wire))
+		hr, err := http.NewRequestWithContext(ctx, http.MethodPost, chat, strings.NewReader(wire))
 		if err != nil {
 			return nil, 500, "Qoder: " + err.Error()
 		}

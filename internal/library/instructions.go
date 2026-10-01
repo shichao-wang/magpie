@@ -68,7 +68,7 @@ func (l *Library) active() string {
 func (l *Library) sharedPath() string { return setPath(l.active()) }
 
 func extraPath(agent string) string {
-	return filepath.Join(Dir(), "instructions", agent+".md")
+	return filepath.Join(Dir(), "instructions", fileName(agent)+".md")
 }
 
 func readText(path string) string {
@@ -79,7 +79,7 @@ func readText(path string) string {
 func writeText(path, text string) error {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := edit.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		return nil
@@ -187,7 +187,7 @@ func (l *Library) syncInstructions(t *Target, b *backups, res *Result) {
 		return
 	}
 	if strings.TrimSpace(next) == "" && len(raw) > 0 && own(file) == "" {
-		err = os.Remove(t.Instructions)
+		err = edit.Remove(t.Instructions)
 	} else if next != "" {
 		err = edit.WriteAtomic(t.Instructions, []byte(next))
 	}
@@ -298,7 +298,7 @@ func SaveInstructions(c InstructionsChange) (*Result, error) {
 			if x == nil {
 				continue
 			}
-			if err := checkName("agent", id); err != nil {
+			if err := checkAgent(id); err != nil {
 				return err
 			}
 			if err := writeText(extraPath(id), *x); err != nil {
@@ -348,7 +348,7 @@ func ImportInstructions(id string) (*Result, error) {
 			next = withBlock("", block)
 		}
 		if next == "" {
-			err = os.Remove(t.Instructions)
+			err = edit.Remove(t.Instructions)
 		} else {
 			err = edit.WriteAtomic(t.Instructions, []byte(next))
 		}

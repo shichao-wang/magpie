@@ -56,6 +56,8 @@ func startBackend() (gw *gateway.Server) {
 		// lists an older magpie wrote into agents' files, without what
 		// it has learnt since (context windows, providers added)
 		agent.SyncCatalog()
+		// and fetched again each day it stays open, for new models' prices
+		catalog.KeepFresh()
 	}()
 	return gw
 }

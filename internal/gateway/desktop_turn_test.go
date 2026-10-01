@@ -98,6 +98,116 @@ func TestClaudeDesktopAuxiliaryModel(t *testing.T) {
 	}
 }
 
+func TestClaudeDesktopTiers(t *testing.T) {
+	f := &fake{reply: sse(
+		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"m1","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)}
+	up := setup(t, provider.Anthropic, f)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Anthropic: up.URL,
+		Models: []string{"m1", "m2", "m3", "m4", "claude-opus-5"}}); err != nil {
+		t.Fatal(err)
+	}
+	chosen := map[string]string{"opus": "fake/m1", "sonnet": "fake/m2", "haiku": "fake/m3", "fable": "fake/m4"}
+	before := StandIn
+	StandIn = func(agent, model string) string {
+		if agent == "claude-desktop" {
+			return chosen[DesktopTier(model)]
+		}
+		return ""
+	}
+	t.Cleanup(func() { StandIn = before })
+	send := func(agent, model string, tools bool) string {
+		t.Helper()
+		body := `{"model":"` + model + `","max_tokens":200,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
+		if tools {
+			body = `{"model":"` + model + `","max_tokens":32000,"stream":true,"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}`
+		}
+		f.got = nil
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+		req.Header.Set("x-api-key", Token+"-"+agent)
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", model, rec.Code, rec.Body)
+		}
+		return modelOf(f.got)
+	}
+	for _, model := range desktopTierModels() {
+		id := model["id"].(string)
+		tier := DesktopTier(id)
+		for _, asked := range []string{id, tier, "anthropic/" + id, id + "[1m]", map[string]string{"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-4-5", "fable": "claude-fable-5-1"}[tier]} {
+			for _, tools := range []bool{true, false} {
+				if got := send("claude-desktop", asked, tools); got != strings.TrimPrefix(chosen[tier], "fake/") {
+					t.Fatalf("%s tools=%v: sent %q", asked, tools, got)
+				}
+			}
+		}
+	}
+	// Auxiliary haiku keeps its own route after another tier is selected.
+	send("claude-desktop", "claude-opus-5", true)
+	if got := send("claude-desktop", "haiku", false); got != "m3" {
+		t.Fatalf("haiku after opus: %q", got)
+	}
+	chosen["opus"] = "fake/m4"
+	if got := send("claude-desktop", "claude-opus-5", true); got != "m4" {
+		t.Fatalf("changed opus: %q", got)
+	}
+	delete(chosen, "sonnet")
+	if got := send("claude-desktop", "claude-sonnet-5", false); got != "m1" {
+		t.Fatalf("unset sonnet: %q", got)
+	}
+	if got := send("claude", "claude-opus-5", true); got != "claude-opus-5" {
+		t.Fatalf("another agent's request was overridden: %q", got)
+	}
+	if got := send("claude-desktop", aliasFor("fake/m2"), true); got != "m2" {
+		t.Fatalf("legacy session: %q", got)
+	}
+	// An unset historical Haiku request uses the same default as the fixed alias.
+	delete(chosen, "haiku")
+	send("claude-desktop", "mythos-magpie-opus", true)
+	for _, asked := range []string{"claude-haiku-4-5-20251001", "claude-3-5-haiku-20241022", "haiku", "claude-haiku-magpie"} {
+		if got := send("claude-desktop", asked, false); got != "m1" {
+			t.Fatalf("unset historical haiku %s: %q", asked, got)
+		}
+	}
+	// Counting normalizes tier ids, including requests with tools, without picking a session model.
+	send("claude-desktop", "fake/m2", true)
+	pickedBefore, err := os.ReadFile(desktopPickedPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.reply, f.ctype = `{"input_tokens":7}`, "application/json"
+	for _, asked := range []string{"mythos-magpie-opus", "anthropic/mythos-magpie-opus", "mythos-magpie-opus[1m]", "claude-opus-5", "opus", "anthropic/claude-opus-5", "claude-opus-5[1m]"} {
+		req := httptest.NewRequest("POST", "/v1/messages/count_tokens", strings.NewReader(`{"model":"`+asked+`","tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("x-api-key", TokenFor("claude-desktop"))
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"input_tokens":7`) || modelOf(f.got) != "m4" || f.path != "/v1/messages/count_tokens" {
+			t.Fatalf("count %s: %d %s, upstream %s %s", asked, rec.Code, rec.Body, f.path, f.got)
+		}
+		if pickedAfter, _ := os.ReadFile(desktopPickedPath()); string(pickedAfter) != string(pickedBefore) || desktopSelection("") != "fake/m2" {
+			t.Fatalf("count %s changed the session choice: %q", asked, pickedAfter)
+		}
+	}
+	if got := desktopTurn("claude-sonnet-5-thinking", []byte(`{"max_tokens":200}`)); got != "fake/m2" {
+		t.Fatalf("legacy auxiliary request after counting: %q", got)
+	}
+}
+
+func TestClaudeDesktopTierEmptyCatalog(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	for _, id := range []string{"claude-opus-magpie", "mythos-magpie-sonnet", "claude-haiku-magpie", "claude-fable-magpie"} {
+		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"`+id+`","max_tokens":200,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("x-api-key", TokenFor("claude-desktop"))
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, req)
+		if rec.Code != 404 || !strings.Contains(rec.Body.String(), "add a provider") {
+			t.Fatalf("empty catalog %s: %d %s", id, rec.Code, rec.Body)
+		}
+	}
+}
+
 func TestHasTools(t *testing.T) {
 	for body, want := range map[string]bool{
 		`{"model":"x"}`:                         false,

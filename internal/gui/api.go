@@ -12,6 +12,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -56,6 +57,12 @@ type Windows interface {
 	// keeps up with the panel's size; false when it can't, for the page to
 	// go on painting it itself.
 	TintPanel(rgba [4]uint8, ms int) bool
+	// TintTitleBar paints the window's title bar the page's colour, where
+	// the system draws one (Windows); false where there is none to paint.
+	TintTitleBar(rgba [4]uint8, dark bool) bool
+	// SetTextSize zooms the window's and the panel's pages to percent
+	// (settings.TextSizes), the panel's size with them.
+	SetTextSize(percent int)
 }
 
 type fieldJSON struct {
@@ -80,6 +87,9 @@ type agentJSON struct {
 	// Launch: the command that starts an agent taking the gateway only
 	// from its environment (agy) on magpie, to copy
 	Launch string `json:"launch,omitempty"`
+	// Models: how many of the catalog its lists show, for an agent that
+	// picks among it (agent_models.go)
+	Models *modelCountJSON `json:"models,omitempty"`
 }
 
 // clientJSON is an agent, or another client the gateway knows, as a
@@ -115,6 +125,37 @@ type stateJSON struct {
 	// here too (not only in settingsJSON) so a cost drawn before the reader
 	// ever opens Settings already converts, if cny was chosen last time.
 	FX fxJSON `json:"fx"`
+	// Unlisted are the models kept for routing groups, which the pickers
+	// don't offer: a filter that finds one of them says why it isn't there
+	Unlisted []unlistedJSON `json:"unlisted,omitempty"`
+}
+
+// unlistedJSON is a model of a provider kept for routing groups, and the
+// groups ("group/<id>") it is used through, none when it is in no group.
+type unlistedJSON struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Provider string   `json:"provider"`
+	Icon     string   `json:"icon,omitempty"`
+	Groups   []string `json:"groups"`
+}
+
+// unlistedModels lists provider.Unlisted for the page.
+func unlistedModels() []unlistedJSON {
+	es := provider.Unlisted()
+	if len(es) == 0 {
+		return nil
+	}
+	in := provider.MemberGroups()
+	out := make([]unlistedJSON, 0, len(es))
+	for _, e := range es {
+		gs := in[e.ID]
+		if gs == nil {
+			gs = []string{}
+		}
+		out = append(out, unlistedJSON{ID: e.ID, Name: e.Name, Provider: e.Provider.Name, Icon: e.Provider.Icon, Groups: gs})
+	}
+	return out
 }
 
 // fxJSON is a USD→CNY rate as the UI shows it: the number a cost is
@@ -148,6 +189,9 @@ type settingsJSON struct {
 	Version string `json:"version"`
 	Dir     string `json:"dir"`     // where magpie keeps its files, as shown
 	Gateway string `json:"gateway"` // the local endpoint
+	// Mac apps that explicitly handle .command files, for resumed sessions.
+	TerminalApps    []terminalChoice `json:"terminalApps,omitempty"`
+	TerminalDefault string           `json:"terminalDefault,omitempty"`
 	// the proxy vendor requests go through now, and where it came from:
 	// settings, environment, system, off or none
 	ProxyNow    string `json:"proxyNow"`
@@ -164,6 +208,9 @@ type settingsJSON struct {
 	ImageGenModels []modelRef `json:"imageGenModels"`
 	// where other machines reach the gateway while it is shared
 	LANURLs []string `json:"lanURLs,omitempty"`
+	// LANURLs are a container's own addresses, not the host's: the page
+	// offers the one it was opened at instead, or says how to set it
+	LANContainer bool `json:"lanContainer,omitempty"`
 	// when the Codex warm-up last started an account's window
 	CodexWarmed *time.Time `json:"codexWarmed,omitempty"`
 	// and the Claude warm-up
@@ -174,15 +221,27 @@ type settingsJSON struct {
 	WorkBuddyCheckins []provider.WorkBuddyCheckin `json:"workbuddyCheckins,omitempty"`
 	// FX is the dollar-to-yuan rate the cny currency choice shows costs at
 	FX fxJSON `json:"fx"`
+	// NotifyProblem is why a usage alert set wouldn't be seen: "denied"
+	// (notifications turned off for magpie) or "unavailable"
+	NotifyProblem string `json:"notifyProblem,omitempty"`
 }
 
 func settingsState() settingsJSON {
 	s := settingsJSON{Settings: settings.Load(), Version: Version, Dir: tilde(settings.Dir()), Gateway: gateway.URL()}
+	if found, err := discoverTerminals(); err == nil {
+		for _, app := range found.Apps {
+			s.TerminalApps = append(s.TerminalApps, terminalChoice{ID: app.ID, Name: app.Name})
+		}
+		s.TerminalDefault = found.Default
+	}
 	s.FX = currentFX()
+	if (s.UsageAlert > 0 || s.BalanceAlert > 0) && notifyProblem != nil {
+		s.NotifyProblem = notifyProblem()
+	}
 	s.ProxyNow, s.ProxySource = netproxy.Describe()
 	s.Login = autostart.Enabled()
 	if s.LAN {
-		s.LANURLs = gateway.LANURLs()
+		s.LANURLs, s.LANContainer = gateway.LANURLs(), gateway.ContainerAddrs()
 	}
 	s.CodexWarmed, s.ClaudeWarmed = latest(provider.CodexWarmed()), latest(provider.ClaudeWarmed())
 	s.WorkBuddy, s.WorkBuddyCheckins = provider.HasWorkBuddy(), provider.WorkBuddyCheckins()
@@ -253,11 +312,28 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	// they came only with the settings, so the tabs showed English first
 	mux.HandleFunc("GET /boot.js", func(rw http.ResponseWriter, r *http.Request) {
 		s := settings.Load()
-		b, _ := json.Marshal(map[string]any{"lang": s.Lang, "theme": s.Theme, "web": isWeb(w)})
+		// and the text size, which the Mac's header measures against the
+		// traffic lights
+		boot := map[string]any{"lang": s.Lang, "theme": s.Theme, "textSize": s.TextSize, "web": isWeb(w)}
+		// on Omarchy the page takes its theme's look before it paints
+		if th, ok := omarchyTheme(); ok {
+			boot["omarchy"] = th
+		}
+		b, _ := json.Marshal(boot)
 		rw.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 		rw.Header().Set("Cache-Control", "no-store")
 		rw.Write(append(append([]byte("window.bootPrefs = "), b...), ";\n"...))
 	})
+	// the Omarchy theme as it is now, asked again every few seconds so a
+	// theme picked in Omarchy's menu reaches the page at once; null off Omarchy
+	mux.HandleFunc("GET /api/omarchy", func(rw http.ResponseWriter, r *http.Request) {
+		if th, ok := omarchyTheme(); ok {
+			writeJSON(rw, th)
+			return
+		}
+		writeJSON(rw, nil)
+	})
+	omarchyRoutes(mux, w)
 	mux.HandleFunc("GET /api/state", func(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, state())
 	})
@@ -408,6 +484,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	usageRoutes(mux, w)
 	sessionRoutes(mux, w)
 	backupRoutes(mux, w)
+	archiveRoutes(mux)
 	libraryRoutes(mux, w)
 	updateRoutes(mux, w)
 	mux.HandleFunc("GET /api/settings", func(rw http.ResponseWriter, r *http.Request) {
@@ -424,13 +501,29 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		cur := settings.Load()
 		in.AgentOrder, in.AgentsHidden, in.AgentsShown = cur.AgentOrder, cur.AgentsHidden, cur.AgentsShown
 		in.Window = cur.Window // the window's own, as it was last resized
-		// and what other pages keep here: the models' names, levels and
-		// who sees them, and sharing on the network, set on its own
-		in.Visible, in.ModelNames, in.ModelEfforts = cur.Visible, cur.ModelNames, cur.ModelEfforts
+		// and what other pages keep here: which models an agent is shown, and
+		// everything the user said of a model anywhere else in the app, set on
+		// its own. The per-model maps are carried whole rather than named one
+		// by one, so a map added later is not silently dropped here.
+		//
+		// HiddenModels is the other way round — keyed by agent, not by
+		// "<provider>/<model>" — so it is not one of them, and belongs to the
+		// Agents page.
+		in.Visible, in.HiddenModels = cur.Visible, cur.HiddenModels
+		settings.CarryPerModel(&in, &cur)
 		in.LAN, in.LANKey = cur.LAN, cur.LANKey
-		in.RedactRules = cur.RedactRules // the masking rules, set on their own
+		in.RequestArchive = cur.RequestArchive // the Gateway page's, set on its own
+		in.RedactRules = cur.RedactRules       // the masking rules, set on their own
 		// used or left is the Usage page's toggle as much as Settings', set on its own
 		in.QuotaLeft = cur.QuotaLeft
+		// how agents' lists name models, set on its own for the agents to be told
+		in.PlainNames = cur.PlainNames
+		// which Codex accounts spend a reset by themselves, set on the Usage card
+		in.CodexAutoReset = cur.CodexAutoReset
+		// and the text size, which the keyboard changes too (text-size below)
+		in.TextSize = cur.TextSize
+		// the version the Update pill was hidden for, set from the pill
+		in.UpdateSkip = cur.UpdateSkip
 		if v := strings.TrimSpace(in.Vision); v != "" && v != "off" && v != cur.Vision {
 			if _, _, ok := provider.Resolve(v); !ok {
 				fail(rw, fmt.Errorf("no model %s to describe images", v))
@@ -450,8 +543,26 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		if (in.Dock != cur.Dock || in.DockWindow != cur.DockWindow) && onDock != nil {
 			onDock(in)
 		}
-		if (in.TrayUsage != cur.TrayUsage || in.TrayUsageEvery != cur.TrayUsageEvery) && onTrayUsage != nil {
+		// the cards the menu bar shows, any of them (TrayUsage is only the first),
+		// how often, and with their logos or not
+		if (!slices.Equal(settings.Load().TrayUsages, cur.TrayUsages) || in.TrayUsageEvery != cur.TrayUsageEvery ||
+			in.TrayNoLogos != cur.TrayNoLogos) && onTrayUsage != nil {
 			onTrayUsage()
+		}
+		// an alert turned on or moved is looked at now, the Mac asked for its
+		// leave to notify as it is turned on (#368)
+		if (in.UsageAlert != cur.UsageAlert || in.BalanceAlert != cur.BalanceAlert) &&
+			(in.UsageAlert > 0 || in.BalanceAlert > 0) && onAlerts != nil {
+			onAlerts()
+		}
+		// the tray menu follows the page's language (#301)
+		if in.Lang != cur.Lang && onLang != nil {
+			onLang()
+		}
+		// an update check that failed, without the proxy set just now, is
+		// tried again through it, not in six hours (#294)
+		if strings.TrimSpace(in.Proxy) != strings.TrimSpace(cur.Proxy) && updates.json().State == "error" {
+			go updates.check()
 		}
 		writeJSON(rw, settingsState())
 	})
@@ -472,6 +583,79 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		if changed && onTrayUsage != nil {
 			onTrayUsage()
+		}
+		writeJSON(rw, settingsState())
+	})
+	// the version the header's Update pill is hidden for, until a newer one
+	// is out: set from the pill, cleared ("") from Settings
+	mux.HandleFunc("POST /api/settings/update-skip", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Version string `json:"version"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		s := settings.Load()
+		s.UpdateSkip = strings.TrimSpace(in.Version)
+		if err := settings.Save(s); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// whether the agents' lists name a model with its provider's after it or
+	// alone (#335): their files are written again, and Codex asks again
+	mux.HandleFunc("POST /api/settings/plain-names", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ On bool }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetPlainNames(in.On); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// whether a Codex account spends one of its resets by itself once its
+	// week is used up, the Usage card's toggle, set on its own
+	mux.HandleFunc("POST /api/settings/codex-auto-reset", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			User string
+			On   bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if strings.TrimSpace(in.User) == "" {
+			fail(rw, fmt.Errorf("which Codex account?"))
+			return
+		}
+		if err := provider.SetCodexAutoReset(in.User, in.On); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// how large the window and the panel are drawn: Settings' choice and
+	// Ctrl/Cmd +, − and 0 in either, set on its own so a key pressed while
+	// the Settings page saves something else is never undone by it
+	mux.HandleFunc("POST /api/settings/text-size", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Size int }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		s := settings.Load()
+		s.TextSize = in.Size
+		if err := settings.Save(s); err != nil {
+			fail(rw, err)
+			return
+		}
+		if w != nil {
+			w.SetTextSize(in.Size)
 		}
 		writeJSON(rw, settingsState())
 	})
@@ -568,9 +752,15 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 				writeJSON(rw, map[string]bool{"ok": true})
 				return
 			}
+		case "titlebar":
+			if c, _, ok := parseTint(r.URL.Query()); ok && w.TintTitleBar(c, r.URL.Query().Get("dark") == "1") {
+				writeJSON(rw, map[string]bool{"ok": true})
+				return
+			}
 		}
 		rw.WriteHeader(http.StatusNoContent)
 	})
+	agentModelsAPI(mux)
 	devListen(mux)
 	return mux
 }
@@ -583,19 +773,14 @@ func state() stateJSON {
 	if s.Settings.Currency == "cny" {
 		s.FX = currentFX()
 	}
+	s.Unlisted = unlistedModels()
 	for _, a := range agent.Clients() {
 		s.Clients = append(s.Clients, clientJSON{ID: a.ID, Name: a.Name, Icon: a.Icon})
 	}
 	for _, a := range agent.Detected() {
 		vals := a.Values()
-		aj := agentJSON{ID: a.ID, Name: a.Name, Icon: a.Icon, Path: tilde(a.Path), Fields: []fieldJSON{}}
-		for _, f := range a.Fields {
-			opts := f.Options(vals)
-			if opts == nil {
-				opts = []agent.Option{}
-			}
-			aj.Fields = append(aj.Fields, fieldJSON{Key: f.Key, Label: f.Label, Value: vals[f.Key], Options: opts})
-		}
+		aj := agentJSON{ID: a.ID, Name: a.Name, Icon: a.Icon, Path: tilde(a.Path), Fields: agentFields(a, vals)}
+		aj.Models = agentModelCount(a.ID, aj.Fields)
 		aj.Drift = a.Drift()
 		if a.Import != nil {
 			aj.Import, aj.Added = a.Import(), a.Added != nil && a.Added()

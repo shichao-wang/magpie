@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -162,6 +163,19 @@ func gemini(home string) *Agent {
 		ID: "gemini", Name: "Gemini CLI", Icon: "geminicli-color", Aliases: []string{"gemini-cli"},
 		UA:  []string{"geminicli", "gemini-cli"},
 		Bin: "gemini", Dir: dir, Path: path,
+		// Gemini CLI is its binary. What it leaves in ~/.gemini stays when it
+		// is uninstalled (#230), and Antigravity keeps its folders there too
+		// (antigravity, antigravity-cli, config) and reads GEMINI.md (#330),
+		// so nothing there says Gemini CLI is here: a row for it would set
+		// up a CLI that can't run. The desktop app's PATH has the user's
+		// shell's (proc.UserPath).
+		detect: func() bool {
+			if Taken(dir) {
+				return false
+			}
+			_, err := exec.LookPath("gemini")
+			return err == nil
+		},
 		Check: func() string {
 			if !isMagpie(model()) {
 				return ""

@@ -8,6 +8,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,8 +18,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Protocol is a wire API magpie can speak to an upstream.
@@ -93,6 +97,25 @@ type Provider struct {
 	// ignore them: their auth is the agent's own.
 	Headers map[string]string `json:"headers,omitempty"`
 
+	// Searches says the vendor answers a web search tool offered on its
+	// Anthropic or Responses API by itself (web_search_20250305,
+	// web_search): a relay in front of Anthropic's or OpenAI's API, which
+	// magpie can't tell from its host. A request offering one then goes to
+	// it as the client sent it, rather than given magpie's search (#359).
+	Searches bool `json:"searches,omitempty"`
+
+	// Proxy is the proxy magpie's requests to this provider go through
+	// (#237: Codex through one, a vendor at home without): "" follows
+	// the global one (Settings' Proxy, the environment's, the system's),
+	// "direct" none, anything else the proxy's address (http://, https://,
+	// socks5://; host:port means http). Signed-in accounts keep it too.
+	Proxy string `json:"proxy,omitempty"`
+	// AccountProxies is, for a subscription holding several accounts
+	// (Codex's, Claude Code's…), the proxy of each account that has one
+	// of its own, by its name in lower case, as Proxy takes one; an
+	// account not in it follows Proxy (see ProxyChoice).
+	AccountProxies map[string]string `json:"accountProxies,omitempty"`
+
 	// BalanceURL, when set, is where the vendor tells what is left on a
 	// key, asked with the key the way a chat request carries it; BalancePath
 	// picks the amount out of the JSON reply (see balance.go). The vendors
@@ -105,6 +128,11 @@ type Provider struct {
 	// BalanceURL (see TakesBalanceToken). It is asked with nothing else but
 	// the provider's headers, when the endpoint is one named.
 	BalanceToken string `json:"balanceToken,omitempty"`
+	// ZhipuTeam, for a Zhipu or Z.ai key on a team's GLM Coding Plan, is
+	// the team's organization and project, from the BigModel console: the
+	// team's windows are told to the key only with them (see
+	// zhipuKeyTeamWindows). nil for a key of the user's own plan.
+	ZhipuTeam *ZhipuTeam `json:"zhipuTeam,omitempty"`
 
 	// ModelsURL, when set, is where the vendor lists its models, for one
 	// that lists them away from the base URL requests go to (Xiaomi MiMo's
@@ -216,6 +244,7 @@ func All() []Provider {
 		}
 		pk := picks[a.ID]
 		a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.Contexts, pk.Family
+		a.Proxy, a.AccountProxies = pk.Proxy, pk.AccountProxies
 		if a.ID == "cursor" { // picked before its efforts were one model
 			a.Models = cursorPicks(a.Models)
 		}
@@ -295,6 +324,12 @@ func Save(p Provider) error {
 	if p.ID == strings.TrimSuffix(GroupPrefix, "/") {
 		return errors.New(`"group" starts the ids of routing groups; pick another id`)
 	}
+	if err := settings.CheckProxy(p.Proxy); err != nil {
+		return err
+	}
+	if err := checkAccountProxies(p.AccountProxies); err != nil {
+		return err
+	}
 	if p.Name == "" {
 		p.Name = p.ID
 	}
@@ -308,13 +343,17 @@ func Save(p Provider) error {
 		if p.ID == "kiro" {
 			key = p.Key
 		}
-		p = Provider{ID: p.ID, Key: key, Models: p.Models, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Affinity: p.Affinity, Contexts: p.Contexts, Family: p.Family, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID)}
+		p = Provider{ID: p.ID, Key: key, Models: p.Models, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Affinity: p.Affinity, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID)}
 	} else {
+		p.AccountProxies = nil // a provider of a key has no accounts to proxy apart
 		if slices.Contains(accountIDs, p.ID) && !stored(p.ID) {
 			// taken, it would hide that subscription once signed in
 			return fmt.Errorf("%q is the id of the %s subscription; pick another name", p.ID, p.ID)
 		}
 		if p.Chat == "" && p.Responses == "" && p.Anthropic == "" && p.Decide == "" {
+			if p.Preset == AzurePreset {
+				return errors.New("Azure OpenAI needs your resource's endpoint, e.g. https://<resource>.openai.azure.com")
+			}
 			return errors.New("a provider needs a base URL")
 		}
 		if p.Key == "" && !keyOptional(p) {
@@ -341,6 +380,10 @@ func Save(p Provider) error {
 // second key of a vendor, or one key for another workspace, is a provider of
 // its own rather than one replacing the first. It answers the id saved.
 func Add(p Provider) (string, error) {
+	return add(p, true)
+}
+
+func add(p Provider, once bool) (string, error) {
 	p.ID = strings.ToLower(strings.TrimSpace(p.ID))
 	if p.ID == "" {
 		p.ID = Slug(p.Name)
@@ -351,14 +394,54 @@ func Add(p Provider) (string, error) {
 		p.ID = hostID(p)
 	}
 	// the same key on the same host with the same headers is the one
-	// already here, not another: adding it twice would only split its usage
+	// already here, not another: adding it twice would only split its usage.
+	// A copy the user asked for is taken (AddCopy).
 	for _, h := range All() {
-		if h.Account == nil && sameProvider(h, normalize(p)) {
+		if once && h.Account == nil && sameProvider(h, normalize(p)) {
 			return "", fmt.Errorf("%s is already added with that key (%s); magpie provider key %s <key> changes its key", h.Name, h.ID, h.ID)
 		}
 	}
 	p.ID, p.Name = freeID(p.ID), freeName(p.Name)
 	return p.ID, Save(p)
+}
+
+// AddCopy adds p, a copy the user made of the provider from (#268), beside
+// it: what the form doesn't carry — the keys, the balance token, how
+// requests spread over the keys, where they fall back to — is from's where
+// p leaves it out. The same key on the same host is taken, the copy being
+// asked for (another model list, another endpoint). A signed-in account is
+// never copied: its sign-in is the agent's.
+func AddCopy(p Provider, from string) (string, error) {
+	src, err := Find(from)
+	if err != nil {
+		return "", err
+	}
+	if src.Account != nil {
+		return "", fmt.Errorf("%s is a signed-in account, which can't be copied", src.Name)
+	}
+	if p.Key == "" {
+		p.Key, p.KeyName, p.KeyProtocol = src.Key, src.KeyName, src.KeyProtocol
+		p.Keys = slices.Clone(src.Keys)
+		p.Routing, p.Affinity = src.Routing, src.Affinity
+	}
+	if p.BalanceToken == "" {
+		p.BalanceToken = src.BalanceToken
+	}
+	if p.ZhipuTeam == nil {
+		p.ZhipuTeam = src.ZhipuTeam
+	}
+	if p.Fallback == nil {
+		p.Fallback = slices.Clone(src.Fallback)
+	}
+	p.Unlisted = p.Unlisted || src.Unlisted
+	p.Searches = p.Searches || src.Searches
+	if p.Website == "" {
+		p.Website = src.Website
+	}
+	if p.KeysURL == "" {
+		p.KeysURL = src.KeysURL
+	}
+	return add(p, false)
 }
 
 // hostID is an id for a provider from the host it is on: api.relay.com is
@@ -406,7 +489,7 @@ func freeName(name string) string {
 }
 
 // accountIDs are the ids of the subscriptions magpie can list (account.go).
-var accountIDs = []string{"antigravity", "claude", "codex", CommandCodePlanID, "copilot", "cursor", "devin", "gemini", "grok", "kiro", "qoder", "workbuddy", WorkBuddyAIID, "zcode"}
+var accountIDs = []string{"antigravity", "claude", "codex", CommandCodePlanID, "copilot", "cursor", "devin", "factory", "gemini", "grok", "kiro", MiMoID, "qoder", QoderCNID, "workbuddy", WorkBuddyAIID, "zcode", "zed"}
 
 func stored(id string) bool {
 	for _, p := range load().Providers {
@@ -464,6 +547,14 @@ func ShowAccount(id string) error {
 // Delete removes a provider. An account is only hidden from magpie (its
 // model picks kept); signing out is the agent's job.
 func Delete(id string) error {
+	if p, ok := find(Accounts(), id); ok && p.IsPlugin() && !Moved(p.Account.plugin.ID) {
+		// a plugin's sign-in is magpie's own: removing it signs out. A
+		// built-in moved onto its plugin is only hidden, as the built-in
+		// was, its accounts and model picks kept.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return plugin.SignOut(ctx, p.Account.plugin.ID, "")
+	}
 	if _, ok := find(Accounts(), id); ok {
 		f := load()
 		for i := range f.Providers {
@@ -505,6 +596,10 @@ func normalize(p Provider) Provider {
 	p.ID = strings.ToLower(strings.TrimSpace(p.ID))
 	p.Name = strings.TrimSpace(p.Name)
 	p.Key = strings.TrimSpace(p.Key)
+	p.Proxy = strings.TrimSpace(p.Proxy)
+	p.AccountProxies = normalAccountProxies(p.AccountProxies)
+	p.ZhipuTeam = p.ZhipuTeam.normal()
+	p.remoteMagpieEndpoints()
 	for _, u := range []*string{&p.Chat, &p.Responses, &p.Anthropic, &p.Decide, &p.Website, &p.KeysURL} {
 		*u = strings.TrimRight(strings.TrimSpace(*u), "/")
 		if *u != "" && !strings.Contains(*u, "://") {
@@ -523,6 +618,12 @@ func normalize(p Provider) Provider {
 	}
 	p.Models = cleanList(p.Models)
 	p.Fallback = cleanList(p.Fallback)
+	// a provider saved under the id the qianfan preset carried its first
+	// day (qianfan-token-plan, v0.1.394) is the preset since renamed:
+	// its own id stays, so whatever the agents wired to it keeps routing
+	if p.Preset == "qianfan-token-plan" {
+		p.Preset = "baidu-qianfan"
+	}
 	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed {
 		p.Routing = ""
 	}
@@ -536,6 +637,9 @@ func normalize(p Provider) Provider {
 	if p.Responses == "" && strings.HasSuffix(p.Chat, "/openai/v1") && p.IsBedrock() {
 		p.Responses = p.Chat
 	}
+	// Azure OpenAI's resource, however its endpoint was pasted, is asked
+	// on its v1 API, chat completions and Responses both (azure.go)
+	p.azureEndpoints()
 	// a preset's provider keeps its headers too: the preset gives the
 	// endpoints and catalog, the headers say which workspace or app it is
 	p.Headers = cleanHeaders(p.Headers)
@@ -551,6 +655,14 @@ func normalize(p Provider) Provider {
 		}
 		if p.KeysURL == "" {
 			p.KeysURL = pr.KeysURL
+		}
+		// a region's own key page goes with its endpoints (Qianfan's pay
+		// as you go makes its keys on the IAM page, the plans at the
+		// plan console)
+		for _, r := range pr.Regions {
+			if r.KeysURL != "" && p.atRegion(r) {
+				p.KeysURL = r.KeysURL
+			}
 		}
 	}
 	return p
@@ -617,7 +729,7 @@ func (p Provider) Base(proto Protocol) string {
 // Speaks lists the protocols the vendor serves natively, preferred first.
 func (p Provider) Speaks() []Protocol {
 	// a Google sign-in speaks Code Assist, and only that
-	if p.Account != nil && p.Account.codeAssist != "" {
+	if p.Account != nil && p.Account.codeAssist != "" && !p.IsPlugin() {
 		return []Protocol{CodeAssist}
 	}
 	var out []Protocol
@@ -625,6 +737,10 @@ func (p Provider) Speaks() []Protocol {
 		if p.Base(pr) != "" {
 			out = append(out, pr)
 		}
+	}
+	// a plugin's Gemini models, beside what else it serves
+	if p.IsPlugin() && p.Account.codeAssist != "" {
+		out = append(out, CodeAssist)
 	}
 	return out
 }
@@ -635,7 +751,9 @@ func (p Provider) ResponsesFirst(model string) bool {
 	if p.Responses != "" && p.IsBedrock() {
 		return bedrockGPT(model)
 	}
-	if p.Responses == "" || (p.ID != "copilot" && HostOf(p.Responses) != "api.openai.com") {
+	// Azure OpenAI's deployments are named as the user likes; one named
+	// for its model (gpt-5-codex, o4-mini) is taken for it
+	if p.Responses == "" || (p.ID != "copilot" && HostOf(p.Responses) != "api.openai.com" && !p.IsAzure()) {
 		return false
 	}
 	m := strings.ToLower(model[strings.LastIndex(model, "/")+1:])
@@ -674,6 +792,9 @@ func (p Provider) Native(model string) Protocol {
 
 // Host is the vendor's API host, for display.
 func (p Provider) Host() string {
+	if p.Account != nil && p.Account.moved {
+		return p.Account.wasHost // not plugin://<id>
+	}
 	for _, pr := range p.Speaks() {
 		if u := p.Base(pr); u != "" {
 			return HostOf(u)

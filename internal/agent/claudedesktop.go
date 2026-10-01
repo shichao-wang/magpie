@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,6 +37,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // desktopProfileID is magpie's profile in Desktop's configLibrary: a
@@ -79,6 +81,14 @@ func desktopDirs(goos, home string, getenv func(string) string) (string, string)
 	return filepath.Join(d, "Claude"), filepath.Join(d, "Claude-3p")
 }
 
+// DesktopConfig3p is the claude_desktop_config.json Claude Desktop reads in
+// its 3p mode: there its whole userData is Claude-3p, its MCP servers too
+// (%LOCALAPPDATA%\Claude-3p on Windows, Claude-3p beside Claude elsewhere).
+func DesktopConfig3p(home string) string {
+	_, d := desktopDirs(runtime.GOOS, home, os.Getenv)
+	return filepath.Join(d, "claude_desktop_config.json")
+}
+
 // windowsDesktopDir is %LOCALAPPDATA%\Claude (or Claude-3p), else the first
 // folder there named Claude… (with -3p in it or not), as CC Switch finds it.
 func windowsDesktopDir(local string, threep bool) string {
@@ -113,7 +123,9 @@ func claudeDesktop(home string) *Agent {
 			also = filepath.Join(d, "Claude")
 		}
 	}
-	return &Agent{
+	// Only provider changes need Desktop to read its configuration again.
+	stale := false
+	a := &Agent{
 		ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Aliases: []string{"claude-app"},
 		Dir: p.dir, Path: p.config,
 		detect: func() bool {
@@ -121,13 +133,16 @@ func claudeDesktop(home string) *Agent {
 				if d == "" {
 					continue
 				}
-				if _, err := os.Stat(d); err == nil {
+				if isDir(d) {
 					return true
 				}
 			}
 			return false
 		},
 		Notice: func() string {
+			if !stale {
+				return ""
+			}
 			if desktopWired(p) {
 				return "Claude Desktop reads this at start-up — quit and reopen it to run on magpie (Code and Cowork, no Anthropic sign-in)."
 			}
@@ -155,6 +170,7 @@ func claudeDesktop(home string) *Agent {
 				return ""
 			},
 			Set: func(v string) error {
+				stale = true
 				if v == "" {
 					return desktopOff(p)
 				}
@@ -166,6 +182,92 @@ func claudeDesktop(home string) *Agent {
 			},
 		}},
 	}
+	for _, tier := range claudeTiers {
+		a.Fields = append(a.Fields, Field{
+			Key: tier, Label: tier, Quiet: true,
+			Get: func() string {
+				if !desktopWired(p) {
+					return ""
+				}
+				v, _ := edit.GetJSON(desktopTiersPath(), tier)
+				return v
+			},
+			Set: func(v string) error {
+				stale = false
+				if !desktopWired(p) {
+					if v == "" {
+						return nil
+					}
+					return fmt.Errorf("connect Claude Desktop to magpie first; %s can then have its own model", tier)
+				}
+				if v != "" && !isMagpie(v) {
+					return fmt.Errorf("%s: %q is not a model magpie serves", tier, v)
+				}
+				return jsonSet(desktopTiersPath(), tier)(v)
+			},
+			Options: func(vals map[string]string) []Option {
+				if vals["provider"] != magpieID {
+					return nil
+				}
+				return viaMagpie("claude-desktop", "")
+			},
+		})
+	}
+	return a
+}
+
+func desktopStandIn(home, model string) string {
+	tier := gateway.DesktopTier(model)
+	if tier == "" {
+		return ""
+	}
+	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	if !desktopWired(p) {
+		return ""
+	}
+	v, _ := edit.GetJSON(desktopTiersPath(), tier)
+	if isMagpie(v) {
+		return v
+	}
+	return ""
+}
+
+// DesktopTiers reads all four choices once for a model discovery request.
+func DesktopTiers() map[string]string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	return desktopTiers(home)
+}
+
+func desktopTiers(home string) map[string]string {
+	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	if !desktopWired(p) {
+		return nil
+	}
+	b, err := edit.Read(desktopTiersPath())
+	var tiers map[string]string
+	if err != nil || json.Unmarshal(b, &tiers) != nil {
+		return nil
+	}
+	for tier, model := range tiers {
+		if !isMagpie(model) {
+			delete(tiers, tier)
+		}
+	}
+	return tiers
+}
+
+// Desktop has no native tier settings. Keep magpie's choices beside its own
+// settings, not as keys Desktop might rewrite in the gateway profile.
+func desktopTiersPath() string { return filepath.Join(settings.Dir(), "claude-desktop-tiers.json") }
+
+func desktopClearTiers() error {
+	if err := os.Remove(desktopTiersPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // desktopWired: _meta.json lists magpie's profile.
@@ -325,7 +427,7 @@ func desktopOff(p desktopPaths) error {
 		made = strings.Split(m, "\n")
 	}
 	if !stashed && !slices.ContainsFunc(entries, desktopOurs) {
-		return nil
+		return desktopClearTiers()
 	}
 
 	for f, was := range map[string]string{p.config: mode, p.config3p: mode3p} {
@@ -393,7 +495,7 @@ func desktopOff(p desktopPaths) error {
 			os.Remove(f)
 		}
 	}
-	return nil
+	return desktopClearTiers()
 }
 
 func desktopEmpty(b []byte) bool {

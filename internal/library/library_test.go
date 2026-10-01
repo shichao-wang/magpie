@@ -28,12 +28,17 @@ func sandbox(t *testing.T) string {
 	t.Setenv("HOME", h)
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
-	t.Setenv("PATH", "")
+	// Gemini CLI is found by its binary alone
+	bin := filepath.Join(h, "bin")
+	write(t, filepath.Join(bin, "gemini"), "#!/bin/sh\n")
+	os.Chmod(filepath.Join(bin, "gemini"), 0o755)
+	write(t, filepath.Join(bin, "gemini.exe"), "")
+	t.Setenv("PATH", bin)
 	// never the machine's global node_modules
 	roots := piGlobalRoots
 	piGlobalRoots = func() []string { return nil }
 	t.Cleanup(func() { piGlobalRoots = roots })
-	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "COPILOT_HOME", "APPDATA", "LOCALAPPDATA", "DSH_HOME"} {
+	for _, k := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "OMO_CODING_AGENT_DIR", "SENPI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE", "COPILOT_HOME", "APPDATA", "LOCALAPPDATA", "DSH_HOME", "HERMES_HOME", "KIMI_CODE_HOME", "KIMI_SHARE_DIR", "GROK_HOME", "FACTORY_HOME_OVERRIDE", "CLINE_DIR", "CLINE_DATA_DIR", "CLINE_MCP_SETTINGS_PATH", "QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR"} {
 		t.Setenv(k, "")
 	}
 	for _, f := range []string{

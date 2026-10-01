@@ -65,9 +65,9 @@ func TestLoginUsageGrokMixedCache(t *testing.T) {
 		w.Write([]byte(`{"config":{"creditUsagePercent":12,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"}}}`))
 	}))
 	defer fake.Close()
-	old := grokBase
-	grokBase = fake.URL
-	t.Cleanup(func() { grokBase = old })
+	old := GrokBase
+	GrokBase = fake.URL
+	t.Cleanup(func() { GrokBase = old })
 
 	for i := range 2 { // the fetched account is cached on the second read
 		u := LoginUsage(context.Background(), "grok")
@@ -122,9 +122,6 @@ func TestGrokAccounts(t *testing.T) {
 	}
 	if err := ForgetLogin("grok", "two@x.ai"); err == nil {
 		t.Fatal("forgot the account in use first")
-	}
-	if err := ForgetLogin("grok", "me@x.ai"); err == nil {
-		t.Fatal("forgot the CLI's own sign-in")
 	}
 	if err := SetLoginOn("grok", "me@x.ai", false); err != nil {
 		t.Fatal(err)

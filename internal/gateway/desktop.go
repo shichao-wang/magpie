@@ -211,13 +211,14 @@ func isClaudeDesktop(r *http.Request) bool {
 // user never picked. Claude Code in its Code tab asks for its own
 // claude-haiku-… by name for small tasks too.
 //
-// A session's turns carry tools; the model the latest one is for is the one
-// the user picked. A small tool-less request (a title's max_tokens is 200,
-// a turn's tens of thousands) for a model whose id reads as Claude's, and
-// any request for a model magpie doesn't serve, goes to that model instead,
-// so a chat the user started on a Claude model of their own stays on it. It is
-// kept on disk, so a title asked for before the first turn after a restart
-// goes there too; before any turn at all it goes to desktopDefault.
+// Desktop's four tier ids and historical tier requests use their own
+// configuration, or the first visible catalog model when unconfigured.
+// Catalog selections, including older sessions using hashed aliases, retain
+// their model. Turns carrying tools remember the selection as a fallback for
+// unserved or small tool-less requests.
+// It is kept on disk so these auxiliary requests can still resolve before
+// the first full turn after a restart; before any selection, they use
+// desktopDefault.
 var desktopPicked struct {
 	sync.Mutex
 	model string
@@ -226,54 +227,106 @@ var desktopPicked struct {
 
 func desktopPickedPath() string { return filepath.Join(settings.Dir(), "claude-desktop.model") }
 
-// desktopTurn is the model a Claude Desktop request for asked is served by.
-func desktopTurn(asked string, body []byte) string {
-	if asked == "" {
-		return asked
+func desktopStandIn(model string) string {
+	if StandIn == nil {
+		return ""
 	}
-	tools := hasTools(body)
+	model = strings.ToLower(strings.TrimSuffix(model, "[1m]"))
+	if tier := DesktopTier(model); tier != "" {
+		model = tier
+	}
+	if m := StandIn("claude-desktop", model); m != "" && m != model {
+		return m
+	}
+	return ""
+}
+
+// desktopSelection holds the lock only for selection state and its file, never provider resolution.
+func desktopSelection(remember string) string {
 	desktopPicked.Lock()
 	defer desktopPicked.Unlock()
-	if path := desktopPickedPath(); desktopPicked.from != path {
+	path := desktopPickedPath()
+	if desktopPicked.from != path {
 		b, _ := os.ReadFile(path)
 		desktopPicked.model, desktopPicked.from = strings.TrimSpace(string(b)), path
 	}
 	picked := desktopPicked.model
-	if asked == picked {
+	if remember != "" {
+		desktopPicked.model = remember
+		if os.MkdirAll(settings.Dir(), 0o755) == nil {
+			os.WriteFile(path, []byte(remember+"\n"), 0o600)
+		}
+	}
+	return picked
+}
+
+func desktopSessionModel(picked string) string {
+	if DesktopTier(picked) != "" && (desktopFixedTier(picked) || unserved(picked)) {
+		return desktopDefault(picked)
+	}
+	return picked
+}
+
+// desktopTurn resolves a generation request and remembers full turns carrying tools.
+func desktopTurn(asked string, body []byte) string {
+	return desktopResolve(asked, body, true)
+}
+
+// Counting uses the same resolution without remembering a selection.
+func desktopResolve(asked string, body []byte, remember bool) string {
+	if asked == "" {
 		return asked
 	}
-	if unserved(asked) || !tools && small(body) && desktopAccepts(asked) {
-		if picked != "" {
-			return picked
+	tools := hasTools(body)
+	tier := DesktopTier(asked)
+	if tier != "" && (desktopFixedTier(asked) || unserved(asked) || !tools && small(body)) {
+		if remember && tools {
+			desktopSelection(asked)
 		}
 		if m := desktopDefault(asked); m != "" {
 			return m
 		}
 		return asked
 	}
-	if tools {
-		desktopPicked.model = asked
-		if os.MkdirAll(settings.Dir(), 0o755) == nil {
-			os.WriteFile(desktopPickedPath(), []byte(asked+"\n"), 0o600)
+	picked := desktopSelection("")
+	if asked == picked {
+		return asked
+	}
+	if unserved(asked) || !tools && small(body) && desktopAccepts(asked) {
+		if m := desktopStandIn(asked); m != "" {
+			return m
 		}
+		if picked != "" {
+			if m := desktopSessionModel(picked); m != "" {
+				return m
+			}
+		}
+		if m := desktopFirst(asked); m != "" {
+			return m
+		}
+		return asked
+	}
+	if remember && tools {
+		desktopSelection(asked)
 	}
 	return asked
 }
 
-// desktopDefault is the model a request Desktop sends before any turn has
-// named one goes to: a new session's first message is titled before it is
-// sent (ARNO), so nothing is picked yet when the title is asked for. It is
-// the model the agent is set to stand in for asked if there is one, else
-// the model a new Desktop session starts on — the first row of /v1/models
-// (resolveDefaultSessionModel in its app.asar takes the first model it
-// doesn't restrict), which is magpie's first model shown to it. "" when
-// that is asked itself or magpie shows Desktop no model.
+// desktopDefault uses the configured replacement for asked, else the first
+// model shown to Desktop. A new session's first message is titled before it
+// is sent (ARNO), so nothing may be picked yet when the title is asked for.
+// Desktop starts new sessions on the first unrestricted /v1/models row
+// (resolveDefaultSessionModel in its app.asar); unconfigured tiers use the
+// first visible model from magpie's catalog. "" when that is asked itself
+// or magpie shows Desktop no model.
 func desktopDefault(asked string) string {
-	if StandIn != nil {
-		if m := StandIn("claude-desktop", asked); m != "" && m != asked {
-			return m
-		}
+	if m := desktopStandIn(asked); m != "" {
+		return m
 	}
+	return desktopFirst(asked)
+}
+
+func desktopFirst(asked string) string {
 	shown, _ := provider.CatalogFor("claude-desktop")
 	if len(shown) == 0 || shown[0].ID == asked {
 		return ""

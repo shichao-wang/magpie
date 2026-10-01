@@ -45,11 +45,11 @@ func (b *backups) keep(agent, path string) error {
 	if b.dir == "" {
 		b.dir = filepath.Join(BackupDir(), time.Now().Format("2006-01-02_15-04-05.000"))
 	}
-	dst := filepath.Join(b.dir, agent, filepath.Base(path))
+	dst := filepath.Join(b.dir, fileName(agent), filepath.Base(path))
 	if _, err := os.Stat(dst); err == nil {
 		// another file by that name (each dsh profile's cordis.patch.yml):
 		// kept under its folder's name
-		dst = filepath.Join(b.dir, agent, filepath.Base(filepath.Dir(path)), filepath.Base(path))
+		dst = filepath.Join(b.dir, fileName(agent), filepath.Base(filepath.Dir(path)), filepath.Base(path))
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
@@ -57,7 +57,9 @@ func (b *backups) keep(agent, path string) error {
 	return os.WriteFile(dst, data, 0o600)
 }
 
-// prune leaves the newest keepBackups.
+// prune leaves the newest keepBackups, and every one that holds a skill
+// folder set aside (a skill taken out of the library, or an agent's own
+// the library's took the place of): that is the only copy of it left.
 func pruneBackups() {
 	es, err := os.ReadDir(BackupDir())
 	if err != nil {
@@ -65,7 +67,7 @@ func pruneBackups() {
 	}
 	var names []string
 	for _, e := range es {
-		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") && !holdsSkills(filepath.Join(BackupDir(), e.Name())) {
 			names = append(names, e.Name())
 		}
 	}
@@ -74,4 +76,15 @@ func pruneBackups() {
 		os.RemoveAll(filepath.Join(BackupDir(), names[0]))
 		names = names[1:]
 	}
+}
+
+// holdsSkills is whether a backup has skill folders in it: <when>/skills,
+// or <when>/<agent>/skills.
+func holdsSkills(dir string) bool {
+	for _, pat := range []string{"skills", "*/skills"} {
+		if m, _ := filepath.Glob(filepath.Join(dir, pat)); len(m) > 0 {
+			return true
+		}
+	}
+	return false
 }
