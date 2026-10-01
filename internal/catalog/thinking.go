@@ -21,6 +21,9 @@ func ThinkingOf(providers []string, id string) (control string, known bool) {
 						return option.Type, true
 					}
 				}
+				if m.Thinks {
+					return "reasoning", true
+				}
 				return "", true
 			}
 		}

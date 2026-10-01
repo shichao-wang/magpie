@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -18,13 +20,14 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/proc"
 )
 
 // codexClientVersion is the Codex CLI version the models list is asked for
 // when Codex CLI has not asked itself yet: the list leaves out models newer
 // than the client asking.
-const codexClientVersion = "0.154.0"
+const codexClientVersion = "0.159.0"
 
 // codexModels asks the ChatGPT backend which Codex models the account's own
 // plan has — a Free account lists fewer than a Plus or Pro one, and one it
@@ -72,42 +75,114 @@ var codexVersionCache struct {
 func codexVersion() string {
 	codexVersionCache.Lock()
 	defer codexVersionCache.Unlock()
-	if time.Since(codexVersionCache.at) < 10*time.Minute {
-		return codexVersionCache.v
-	}
-	v := codexClientVersion
-	newer := func(c string) {
-		if c = claudeSemverRE.FindString(c); c != "" && compareClaudeVersion(c, v) > 0 {
-			v = c
+	if time.Since(codexVersionCache.at) >= 10*time.Minute {
+		v := codexClientVersion
+		newer := func(c string) {
+			if c = claudeSemverRE.FindString(c); c != "" && compareClaudeVersion(c, v) > 0 {
+				v = c
+			}
 		}
-	}
-	home, _ := os.UserHomeDir()
-	var c struct {
-		ClientVersion string `json:"client_version"`
-	}
-	if b, err := os.ReadFile(filepath.Join(home, ".codex", "models_cache.json")); err == nil && json.Unmarshal(b, &c) == nil {
-		newer(c.ClientVersion)
-	}
-	if exe := codexExecutable(); exe != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if out, err := proc.CommandContext(ctx, exe, "--version").Output(); err == nil {
-			newer(string(out)) // "codex-cli 0.155.1"
+		var c struct {
+			ClientVersion string `json:"client_version"`
 		}
-		cancel()
+		if b, err := os.ReadFile(filepath.Join(codexCLIHome(), "models_cache.json")); err == nil && json.Unmarshal(b, &c) == nil {
+			newer(c.ClientVersion)
+		}
+		if exe := codexExecutable(); exe != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if out, err := proc.CommandContext(ctx, exe, "--version").Output(); err == nil {
+				newer(string(out)) // "codex-cli 0.155.1"
+			}
+			cancel()
+		}
+		codexVersionCache.v, codexVersionCache.at = v, time.Now()
 	}
-	codexVersionCache.v, codexVersionCache.at = v, time.Now()
-	return v
+	return newerVersion(codexVersionCache.v, codexSeen.get())
 }
 
-// codexExecutable finds the codex CLI; a var so tests can fake it.
+// codexCLIHome is where Codex CLI keeps its state: CODEX_HOME, else ~/.codex.
+func codexCLIHome() string {
+	if dir := os.Getenv("CODEX_HOME"); dir != "" {
+		return dir
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".codex")
+}
+
+// newerVersion is the later of two versions, a when b isn't one.
+func newerVersion(a, b string) string {
+	if b = claudeSemverRE.FindString(b); b != "" && (a == "" || compareClaudeVersion(b, a) > 0) {
+		return b
+	}
+	return a
+}
+
+// codexSeen is the newest version a Codex client that came through the
+// gateway said it was. Codex CLI is often out of magpie's reach — installed
+// where a desktop app's PATH doesn't go, its models_cache.json written by
+// the version before an update — and the backend serves a model only to a
+// client new enough for it: signed by the pool as an older Codex, a model
+// Codex CLI reaches on its own answers 400 "The 'gpt-6.1-sol' model is not
+// supported when using Codex with a ChatGPT account".
+var codexSeen seenVersion
+
+type seenVersion struct {
+	sync.Mutex
+	v string
+}
+
+func (s *seenVersion) get() string {
+	s.Lock()
+	defer s.Unlock()
+	return s.v
+}
+
+func (s *seenVersion) saw(v string) {
+	s.Lock()
+	s.v = newerVersion(s.v, v)
+	s.Unlock()
+}
+
+// SawCodexClient notes the version a Codex client's request says it is —
+// its `version` header, else the one in its User-Agent (codex_cli_rs/0.159.0,
+// Codex Desktop/0.159.0) — when the request is Codex's (it names an
+// originator, or its User-Agent is codex_…).
+func SawCodexClient(h http.Header) {
+	ua := h.Get("User-Agent")
+	if h.Get("originator") == "" && !strings.HasPrefix(strings.ToLower(ua), "codex") {
+		return
+	}
+	v := claudeSemverRE.FindString(h.Get("version"))
+	if v == "" {
+		if _, rest, ok := strings.Cut(ua, "/"); ok {
+			if m := claudeSemverRE.FindStringIndex(rest); m != nil && m[0] == 0 {
+				v = rest[:m[1]]
+			}
+		}
+	}
+	if v == "" {
+		return
+	}
+	codexSeen.saw(v)
+}
+
+// codexExecutable finds the codex CLI; a var so tests can fake it. Beyond
+// PATH it looks where npm, nvm, bun, volta, pnpm, mise and the standalone
+// installer put it, which a desktop app's PATH lacks.
 var codexExecutable = func() string {
 	if p, err := exec.LookPath("codex"); err == nil {
 		return p
 	}
-	home, _ := os.UserHomeDir()
-	for _, p := range []string{filepath.Join(home, ".local", "bin", "codex"), "/opt/homebrew/bin/codex", "/usr/local/bin/codex"} {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
+	names := []string{"codex"}
+	if runtime.GOOS == "windows" {
+		names = []string{"codex.cmd", "codex.exe", "codex"}
+	}
+	for _, d := range proc.UserBinDirs() {
+		for _, n := range names {
+			p := filepath.Join(d, n)
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				return p
+			}
 		}
 	}
 	return ""
@@ -183,7 +258,8 @@ func codexFetchSaved(ctx context.Context) {
 		}
 		user := l.User
 		sign := codexSign(func(ctx context.Context) (string, string, error) { return savedLoginToken(ctx, "codex", user) })
-		if ms, err := codexModels(ctx, sign); err == nil {
+		// through the account's own proxy, if it has one
+		if ms, err := codexModels(ViaLogin(ctx, "codex", user), sign); err == nil {
 			catalog.SaveLive(accountModels("codex", user), CodexBase, ms)
 		}
 	}
@@ -202,14 +278,47 @@ func CodexListed() []catalog.Model {
 	})
 }
 
+// CodexNativeHidden is the ChatGPT account's own model slugs the user took
+// out of Codex's list (HiddenModels): the backend lists them, and the
+// gateway drops them from its /models answer as it does the ones not picked.
+func CodexNativeHidden() map[string]bool {
+	off := HiddenModels("codex")
+	if len(off) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, e := range Catalog() {
+		if off[e.ID] && e.Group == "" && e.Provider.Account != nil && e.Provider.Account.Agent == "codex" {
+			out[e.Model] = true
+		}
+	}
+	return out
+}
+
+// CodexListTag names the list Codex is handed, for its ETag: magpie's models
+// and the account's own taken out of it, so either changing has Codex ask
+// for the list again.
+func CodexListTag() string {
+	ms := CodexListed()
+	off := slices.Sorted(maps.Keys(CodexNativeHidden()))
+	for _, slug := range off {
+		ms = append(ms, catalog.Model{ID: "-" + slug})
+	}
+	return codexcat.Tag(ms)
+}
+
 // CodexNativePicked is the set of the ChatGPT account's own model slugs the
 // user kept, and whether they narrowed that list at all. The backend lists
 // every model the account can reach; when the user has picked among them on
 // the codex provider, the gateway keeps its /models answer to those (see
 // codexModels). Not narrowed — the account's list is left whole.
+//
+// A provider switched off picks nothing, as it serves no agent anything
+// (Provider.Off): its picks are kept for when it is switched on again and
+// are not a narrowing now.
 func CodexNativePicked() (map[string]bool, bool) {
 	p, ok := find(All(), "codex")
-	if !ok || len(p.Models) == 0 {
+	if !ok || p.Off || len(p.Models) == 0 {
 		return nil, false
 	}
 	keep := make(map[string]bool, len(p.Models))
@@ -224,11 +333,14 @@ func CodexNativePicked() (map[string]bool, bool) {
 // account (buildResponses).
 func codexListed(shown []Entry, members func(id string) []Member) []catalog.Model {
 	var ms []catalog.Model
-	for _, e := range shown {
+	// named among all shown: the account's own, which the backend lists,
+	// are in Codex's picker beside these
+	labels := Labels(shown)
+	for i, e := range shown {
 		if e.Group == "" && e.Provider.Account != nil && e.Provider.Account.Agent == "codex" {
 			continue
 		}
-		m := catalog.Model{ID: e.ID, Name: e.Label(), Efforts: e.Efforts, Images: e.Images, Context: e.Context}
+		m := catalog.Model{ID: e.ID, Name: labels[i], Efforts: e.Efforts, Images: e.Images, Context: e.Context}
 		if e.Group != "" {
 			for _, mb := range members(e.ID) {
 				if a := mb.Provider.Account; a != nil && a.Agent == "codex" && strings.HasPrefix(mb.Model, "gpt-") {

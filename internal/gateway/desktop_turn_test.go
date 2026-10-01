@@ -132,10 +132,10 @@ func TestClaudeDesktopTiers(t *testing.T) {
 		}
 		return modelOf(f.got)
 	}
-	for _, model := range desktopModels() {
+	for _, model := range desktopTierModels() {
 		id := model["id"].(string)
 		tier := DesktopTier(id)
-		for _, asked := range []string{id, tier, "anthropic/" + id, id + "[1m]", map[string]string{"opus": "claude-opus-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5", "fable": "claude-fable-5"}[tier]} {
+		for _, asked := range []string{id, tier, "anthropic/" + id, id + "[1m]", map[string]string{"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-4-5", "fable": "claude-fable-5-1"}[tier]} {
 			for _, tools := range []bool{true, false} {
 				if got := send("claude-desktop", asked, tools); got != strings.TrimPrefix(chosen[tier], "fake/") {
 					t.Fatalf("%s tools=%v: sent %q", asked, tools, got)
@@ -197,8 +197,7 @@ func TestClaudeDesktopTiers(t *testing.T) {
 func TestClaudeDesktopTierEmptyCatalog(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	for _, model := range desktopModels() {
-		id := model["id"].(string)
+	for _, id := range []string{"claude-opus-magpie", "mythos-magpie-sonnet", "claude-haiku-magpie", "claude-fable-magpie"} {
 		req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"`+id+`","max_tokens":200,"messages":[{"role":"user","content":"hi"}]}`))
 		req.Header.Set("x-api-key", TokenFor("claude-desktop"))
 		rec := httptest.NewRecorder()

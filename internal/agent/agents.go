@@ -64,8 +64,10 @@ func All() []*Agent {
 		gemini(home),
 		agy(home),
 		opencode(home, cfg),
+		openChamber(home, cfg),
 		mimocode(home, cfg),
 		pi(home),
+		omo(home),
 		goose(home, cfg),
 		cursor(home),
 		copilot(home),
@@ -77,6 +79,9 @@ func All() []*Agent {
 		devin(home, cfg),
 		hermes(home),
 		kimi(home),
+		muse(cfg),
+		miniMax(home),
+		droid(home),
 		cline(home),
 		qoder(home),
 		qoderCN(home),
@@ -211,6 +216,12 @@ func magpieProviderJSON(shape string) any {
 // narrowed under a different id than its config shape (mimocode shares
 // OpenCode's shape but is seen as itself by magpie visible).
 func magpieProviderJSONFor(shape, catalog string) any {
+	return magpieProviderJSONAt(shape, catalog, gateway.URL())
+}
+
+// magpieProviderJSONAt is magpieProviderJSONFor for an agent that reaches
+// the gateway at gw: one in a WSL distro under NAT (see wsl.go).
+func magpieProviderJSONAt(shape, catalog, gw string) any {
 	models := magpieModels(catalog) // the catalog is the agent's
 	switch shape {
 	case "opencode":
@@ -225,13 +236,13 @@ func magpieProviderJSONFor(shape, catalog string) any {
 			// group's context (magpie group set … context=) never reaches
 			// it; an output of 0 is OpenCode's own default
 			if m.Context > 0 {
-				e["limit"] = map[string]any{"context": m.Context, "output": m.Output}
+				e["limit"] = map[string]any{"context": m.Context, "output": maxTokens(m)}
 			}
 			e["variants"] = openCodeVariants(m.Efforts)
 			ms[m.ID] = e
 		}
 		return map[string]any{"npm": "@ai-sdk/openai-compatible", "name": "magpie",
-			"options": map[string]any{"baseURL": gatewayV1(), "apiKey": gateway.Token}, "models": ms}
+			"options": map[string]any{"baseURL": gw + "/v1", "apiKey": gateway.Token}, "models": ms}
 	case "crush":
 		var ms []map[string]any
 		for _, m := range models {
@@ -239,13 +250,21 @@ func magpieProviderJSONFor(shape, catalog string) any {
 			if window == 0 {
 				window = 200000
 			}
-			ms = append(ms, map[string]any{"id": m.ID, "name": m.Name, "context_window": window, "default_max_tokens": 16384,
+			// without it Crush caps every reply at 16384 tokens, a model
+			// that can write more of them never asked for it; an output
+			// above the window is cut to it, as it is for every other
+			// agent magpie hands a limit to
+			tokens := maxTokens(m)
+			if tokens == 0 {
+				tokens = 16384
+			}
+			ms = append(ms, map[string]any{"id": m.ID, "name": m.Name, "context_window": window, "default_max_tokens": tokens,
 				"can_reason": len(m.Efforts) > 0})
 		}
 		if ms == nil {
 			ms = []map[string]any{}
 		}
-		return map[string]any{"type": "openai", "name": "magpie", "base_url": gatewayV1(), "api_key": gateway.Token, "models": ms}
+		return map[string]any{"type": "openai", "name": "magpie", "base_url": gw + "/v1", "api_key": gateway.Token, "models": ms}
 	case "pi":
 		var ms []map[string]any
 		for _, m := range models {
@@ -264,7 +283,7 @@ func magpieProviderJSONFor(shape, catalog string) any {
 			case slices.Contains(m.APIs, string(provider.Responses)):
 				e["api"] = "openai-responses"
 			case slices.Contains(m.APIs, string(provider.Anthropic)):
-				e["api"], e["baseUrl"] = "anthropic-messages", gateway.URL()
+				e["api"], e["baseUrl"] = "anthropic-messages", gw
 				if gateway.AdaptiveThinking(m.ID) {
 					e["compat"] = map[string]any{"forceAdaptiveThinking": true}
 				}
@@ -272,7 +291,7 @@ func magpieProviderJSONFor(shape, catalog string) any {
 			if m.Images {
 				e["input"] = []string{"text", "image"}
 			}
-			if levels := piThinkingLevels(m.Efforts); levels != nil {
+			if levels := piThinkingLevels(m.Efforts, e["api"] == "anthropic-messages"); levels != nil {
 				e["thinkingLevelMap"] = levels
 			}
 			// without it Pi takes every model for a 128K one, and compacts
@@ -283,14 +302,14 @@ func magpieProviderJSONFor(shape, catalog string) any {
 			// without it Pi caps every reply at 16384 tokens, a model
 			// that can write 128K included
 			if m.Output > 0 {
-				e["maxTokens"] = m.Output
+				e["maxTokens"] = maxTokens(m)
 			}
 			ms = append(ms, e)
 		}
 		if ms == nil {
 			ms = []map[string]any{}
 		}
-		return map[string]any{"name": "magpie", "baseUrl": gatewayV1(), "api": "openai-completions", "apiKey": gateway.Token, "models": ms}
+		return map[string]any{"name": "magpie", "baseUrl": gw + "/v1", "api": "openai-completions", "apiKey": gateway.Token, "models": ms}
 	}
 	return nil
 }
@@ -313,18 +332,37 @@ func openCodeVariants(efforts []string) map[string]any {
 	return out
 }
 
-// piThinkingLevels is the thinkingLevelMap for a model's efforts. Pi offers
-// xhigh and max only for models that map them, so without it a model whose
-// top level is max stopped at high in Pi.
-func piThinkingLevels(efforts []string) map[string]any {
-	var levels map[string]any
-	for _, e := range efforts {
-		if e == "xhigh" || e == "max" {
-			if levels == nil {
-				levels = map[string]any{}
-			}
-			levels[e] = e
+// piThinkingLevels is the thinkingLevelMap for a model's efforts: every one
+// of Pi's levels (piLevels, pi-ai's EXTENDED_THINKING_LEVELS), the model's
+// own mapped to themselves and the others null. Pi builds /thinking from
+// the map (getSupportedThinkingLevels): a level set to null is hidden and
+// skipped, while one left out is offered (all but xhigh and max), so a map
+// naming only max had Pi offer minimal and medium too, which the vendor
+// turned away (#243). Pi's off is the model's none when it takes one. A
+// model without none has off hidden — Pi's off asks a Responses model for
+// effort none and leaves a Chat model on the vendor's default thinking —
+// except on Anthropic's Messages API, where Pi's off sends thinking
+// disabled, which Claude takes whatever its levels; there off is left out,
+// for Pi to offer as before. A model whose levels magpie doesn't know gets
+// no map: Pi's own defaults, as before.
+func piThinkingLevels(efforts []string, anthropic bool) map[string]any {
+	if len(efforts) == 0 {
+		return nil
+	}
+	levels := map[string]any{}
+	for _, l := range piLevels {
+		e := l
+		if l == "off" {
+			e = "none"
 		}
+		if slices.Contains(efforts, e) {
+			levels[l] = e
+		} else {
+			levels[l] = nil
+		}
+	}
+	if levels["off"] == nil && anthropic {
+		delete(levels, "off")
 	}
 	return levels
 }
@@ -333,9 +371,14 @@ func piThinkingLevels(efforts []string) map[string]any {
 // (mimocode): a provider block with npm/@ai-sdk/openai-compatible, model and
 // small_model fields, and its own auth file beside its config.
 func openCodeLike(id, name, icon, bin, dir, auth string, ua []string, aliases ...string) *Agent {
+	// the first of its files there is, as the agent looks for them; with
+	// none, a new <id>.json
 	path := filepath.Join(dir, id+".json")
-	if _, err := os.Stat(filepath.Join(dir, id+".jsonc")); err == nil {
-		path = filepath.Join(dir, id+".jsonc")
+	for _, name := range []string{id + ".jsonc", id + ".json", "config.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			path = filepath.Join(dir, name)
+			break
+		}
 	}
 	provider := func() any { return magpieProviderJSONFor("opencode", id) }
 	opts := func(key string) func(map[string]string) []Option {
@@ -344,27 +387,26 @@ func openCodeLike(id, name, icon, bin, dir, auth string, ua []string, aliases ..
 		}
 	}
 	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
+	// whether a model the file names, or one OpenChamber sends to the
+	// OpenCode it runs on this config, is one of magpie's: magpie's
+	// provider has to stay
+	onMagpie := func() bool {
+		return usesMagpie(get("model"), get("small_model")) || id == "opencode" && openChamberOnMagpie()
+	}
 	set := func(key string) func(string) error {
 		return func(v string) error {
 			if v == "" {
 				if err := edit.DelJSON(path, key); err != nil {
 					return err
 				}
-				if usesMagpie(get("model"), get("small_model")) {
+				if onMagpie() {
 					return nil
 				}
 				return edit.DelJSON(path, "provider."+magpieID)
 			}
-			if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
-				// a provider of the file's own already sends this model to
-				// magpie: name it there, rather than add a second list of
-				// the same models under magpie's
-				if own := ownGatewayProvider(path, ref); own != "" {
-					return edit.SetJSON(path, edit.KV{Path: key, Value: own + "/" + ref})
-				}
-				if err := edit.SetJSON(path, edit.KV{Path: "provider." + magpieID, Value: provider()}); err != nil {
-					return err
-				}
+			v, err := openCodeRef(path, id, v)
+			if err != nil {
+				return err
 			}
 			return edit.SetJSON(path, edit.KV{Path: key, Value: v})
 		}
@@ -383,7 +425,7 @@ func openCodeLike(id, name, icon, bin, dir, auth string, ua []string, aliases ..
 		Sync: func() error {
 			// a model of magpie's chosen, but its provider gone from the
 			// file: put it back, or the agent has nothing to send it to
-			if _, ok := edit.GetJSON(path, "provider."+magpieID); !ok && usesMagpie(get("model"), get("small_model")) {
+			if _, ok := edit.GetJSON(path, "provider."+magpieID); !ok && onMagpie() {
 				return edit.SetJSON(path, edit.KV{Path: "provider." + magpieID, Value: provider()})
 			}
 			return syncJSON(path, "provider."+magpieID, provider)
@@ -393,6 +435,22 @@ func openCodeLike(id, name, icon, bin, dir, auth string, ua []string, aliases ..
 			{Key: "small", Label: "small", Get: jsonGet(path, "small_model"), Set: set("small_model"), Options: opts("small")},
 		},
 	}
+}
+
+// openCodeRef is the value that makes the OpenCode config at path (agent
+// id's, whose catalog magpie's provider there lists) send model v. One of
+// magpie's goes to a provider of the file's own that already sends it to
+// magpie, named there rather than in a second list of the same models, else
+// to magpie's provider, put in the file; any other is v as it is.
+func openCodeRef(path, id, v string) (string, error) {
+	ref, ok := strings.CutPrefix(v, magpieID+"/")
+	if !ok || !isMagpie(ref) {
+		return v, nil
+	}
+	if own := ownGatewayProvider(path, ref); own != "" {
+		return own + "/" + ref, nil
+	}
+	return v, edit.SetJSON(path, edit.KV{Path: "provider." + magpieID, Value: magpieProviderJSONFor("opencode", id)})
 }
 
 // ownGatewayProvider is the provider in an OpenCode config, other than
@@ -439,18 +497,77 @@ func sameGateway(base string) bool {
 
 func opencode(home, cfg string) *Agent {
 	return openCodeLike("opencode", "OpenCode", "opencode", "opencode",
-		filepath.Join(cfg, "opencode"), filepath.Join(home, ".local", "share", "opencode", "auth.json"),
+		openCodeDir(cfg), filepath.Join(home, ".local", "share", "opencode", "auth.json"),
 		[]string{"opencode"}, "oc")
 }
 
+// openCodeDir is the folder OpenCode reads its user config from:
+// $OPENCODE_CONFIG_DIR when set, else $XDG_CONFIG_HOME/opencode (cfg).
+// OpenCode 2, the one OpenChamber bundles (#321), reads that folder in place
+// of the other; OpenCode 1 reads both, the variable's last, so what magpie
+// writes there wins in either.
+func openCodeDir(cfg string) string {
+	if d := strings.TrimSpace(os.Getenv("OPENCODE_CONFIG_DIR")); d != "" {
+		if abs, err := filepath.Abs(d); err == nil {
+			return abs
+		}
+	}
+	return filepath.Join(cfg, "opencode")
+}
+
+// mimocode is MiMo Code, the CLI, and the engine inside Xiaomi MiMo, the
+// desktop app (#249): both read the same config, which MIMOCODE_HOME moves
+// to its own config folder.
 func mimocode(home, cfg string) *Agent {
+	dir := filepath.Join(cfg, "mimocode")
+	if h := os.Getenv("MIMOCODE_HOME"); filepath.IsAbs(h) {
+		dir = filepath.Join(h, "config")
+	}
 	return openCodeLike("mimocode", "MiMo Code", "mimocode", "mimo",
-		filepath.Join(cfg, "mimocode"), filepath.Join(home, ".local", "share", "mimocode", "auth.json"),
+		dir, filepath.Join(home, ".local", "share", "mimocode", "auth.json"),
 		[]string{"mimocode"}, "mimo")
 }
 
-func pi(home string) *Agent {
-	dir := filepath.Join(home, ".pi", "agent")
+func pi(home string) *Agent { return piIn(here(home)) }
+
+// piIn is Pi as it lives at a place: this machine's home, or a WSL
+// distro's (see wsl.go), its models.json naming the gateway as it reaches
+// it from there.
+func piIn(at place) *Agent {
+	a := piLike(at, "pi", "Pi", piDir(at))
+	a.UA = []string{"pi-"}
+	return a
+}
+
+// piDir is Pi's agent folder at a place: PI_CODING_AGENT_DIR's when set,
+// "~" in it standing for home, else ~/.pi/agent (config.js, getAgentDir).
+// A relative one is Pi's working directory's, which magpie can't know, so
+// it is not taken; nor this machine's variable for a WSL distro's Pi.
+func piDir(at place) string {
+	if at.spell == nil {
+		if d := homeDir(at.home, os.Getenv("PI_CODING_AGENT_DIR")); d != "" {
+			return d
+		}
+	}
+	return filepath.Join(at.home, ".pi", "agent")
+}
+
+// homeDir is the folder an agent's variable names, "~" and "~/…" expanded
+// to home as Pi does; "" when it is empty or relative.
+func homeDir(home, d string) string {
+	if d == "~" || strings.HasPrefix(d, "~/") || (runtime.GOOS == "windows" && strings.HasPrefix(d, `~\`)) {
+		d = filepath.Join(home, d[1:])
+	}
+	if !filepath.IsAbs(d) {
+		return ""
+	}
+	return filepath.Clean(d)
+}
+
+// piLike is Pi, or a fork of it that keeps Pi's settings.json and
+// models.json in an agent folder of its own (OmO, omo.go): id is its id,
+// icon and command, dir its agent folder.
+func piLike(at place, id, name, dir string) *Agent {
 	path := filepath.Join(dir, "settings.json")
 	modelsPath := filepath.Join(dir, "models.json")
 	auth := filepath.Join(dir, "auth.json")
@@ -458,20 +575,19 @@ func pi(home string) *Agent {
 	set := func(kvs ...edit.KV) error { return edit.SetJSON(path, kvs...) }
 	pair := pairSet(set, "defaultProvider", "defaultModel")
 	writeMagpie := func() error {
-		return edit.SetJSON(modelsPath, edit.KV{Path: "providers." + magpieID, Value: magpieProviderJSON("pi")})
+		return edit.SetJSON(modelsPath, edit.KV{Path: "providers." + magpieID, Value: magpieProviderJSONAt("pi", id, at.gw())})
 	}
 	return &Agent{
-		ID: "pi", Name: "Pi", Icon: "pi", Bin: "pi", Dir: dir, Path: path,
-		UA: []string{"pi-"},
+		ID: id, Name: name, Icon: id, Bin: id, Dir: dir, Path: path,
 		Check: func() string {
 			if p, _ := get("defaultProvider"); p != magpieID {
 				return ""
 			}
-			return wiringOff("Pi", modelsPath, func(k string) (string, bool) { return edit.GetJSON(modelsPath, "providers."+magpieID+"."+k) },
-				"baseUrl", gatewayV1(), "apiKey", gateway.Token)
+			return wiringOff(name, modelsPath, func(k string) (string, bool) { return edit.GetJSON(modelsPath, "providers."+magpieID+"."+k) },
+				"baseUrl", at.v1(), "apiKey", gateway.Token)
 		},
 		Sync: func() error {
-			return syncJSON(modelsPath, "providers."+magpieID, func() any { return magpieProviderJSON("pi") })
+			return syncJSON(modelsPath, "providers."+magpieID, func() any { return magpieProviderJSONAt("pi", id, at.gw()) })
 		},
 		Fields: []Field{
 			{
@@ -500,24 +616,25 @@ func pi(home string) *Agent {
 					return piScopeWith(path, v)
 				},
 				Options: func(cur map[string]string) []Option {
-					return append(ownOptions(auth, cur["model"]), viaMagpie("pi", magpieID+"/")...)
+					return append(ownOptions(auth, cur["model"]), viaMagpie(id, magpieID+"/")...)
 				},
 			},
 			{
 				// Pi's startup thinking level, the same list its /thinking offers;
-				// Pi clamps it to what the model supports.
+				// Pi clamps it to what the model supports. Only this field is
+				// written, and only when it changed: rebuilding providers.magpie
+				// here replaced model fields a person had edited, such as a
+				// contextWindow. Picking the model, and the catalog sync, still
+				// refresh the provider.
 				Key: "effort", Label: "thinking",
 				Get: func() string { v, _ := get("defaultThinkingLevel"); return v },
 				Set: func(v string) error {
+					cur, _ := get("defaultThinkingLevel")
+					if v == cur {
+						return nil
+					}
 					if v == "" {
 						return edit.DelJSON(path, "defaultThinkingLevel")
-					}
-					if p, _ := get("defaultProvider"); p == magpieID {
-						// older magpie entries lacked "reasoning", which Pi needs
-						// before it will think at all
-						if err := writeMagpie(); err != nil {
-							return err
-						}
 					}
 					return set(edit.KV{Path: "defaultThinkingLevel", Value: v})
 				},
@@ -544,7 +661,7 @@ func goose(home, cfg string) *Agent {
 		// a goose on PATH may be pressly's database migration tool, a Go
 		// program; Block's goose is Rust, so a Go goose is not the agent
 		detect: func() bool {
-			if _, err := os.Stat(filepath.Dir(path)); err == nil {
+			if isDir(filepath.Dir(path)) {
 				return true
 			}
 			bin, err := exec.LookPath("goose")
@@ -623,6 +740,8 @@ func copilot(home string) *Agent {
 				// come from the list magpie last fetched from Copilot.
 				out := []Option{{Value: "auto", Note: "let Copilot pick", Icon: "githubcopilot"}}
 				if live, _, ok := catalog.Live("copilot"); ok {
+					// magpie's list has Auto too, offered above
+					live = slices.DeleteFunc(slices.Clone(live), func(m catalog.Model) bool { return m.ID == "auto" })
 					out = append(out, options(live, "")...)
 				}
 				return out

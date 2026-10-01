@@ -31,7 +31,9 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // KiroExecutable finds kiro-cli, which refreshes its own sign-in; a var so
@@ -455,11 +457,15 @@ func saveKiro(c kiroCred) {
 }
 
 func writeFileAtomic(path string, b []byte) error {
+	path, err := edit.Target(path) // a symlink stays, its target written
+	if err != nil {
+		return err
+	}
 	tmp := path + ".magpie-tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return steady.Rename(tmp, path)
 }
 
 // kiroPost posts to a sign-in endpoint.

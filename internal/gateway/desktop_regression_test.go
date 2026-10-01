@@ -47,8 +47,11 @@ func TestClaudeDesktopTierCapacitySnapshot(t *testing.T) {
 			data.Data = append(data.Data, model)
 		}
 		for _, m := range data.Data {
+			if m["anthropic_family_tier"] == nil {
+				continue
+			}
 			want := float64(1_000_000)
-			if m["id"] == "mythos-magpie-sonnet" || m["id"] == "claude-haiku-magpie" || m["id"] == "mythos-magpie-fable" {
+			if m["anthropic_family_tier"] == "sonnet" || m["description"] == "group/large in magpie" {
 				want = 2_000_000
 			}
 			for _, key := range []string{"context_window", "context_length", "max_input_tokens"} {
@@ -56,7 +59,7 @@ func TestClaudeDesktopTierCapacitySnapshot(t *testing.T) {
 					t.Errorf("%s %s = %v, want %v", m["id"], key, m[key], want)
 				}
 			}
-			if m["id"] == "mythos-magpie-opus" && m["max_output_tokens"] != float64(32768) {
+			if m["anthropic_family_tier"] == "opus" && m["max_output_tokens"] != float64(32768) {
 				t.Errorf("output capacity: %v", m)
 			}
 		}
@@ -83,14 +86,13 @@ func TestClaudeDesktopTierCatalogVisibility(t *testing.T) {
 		return map[string]string{"opus": "hidden/m", "sonnet": "unlisted/m", "fable": "unlisted/private-model"}
 	}
 	t.Cleanup(func() { DesktopTiers = before })
-	models := desktopModels()
+	models := desktopTierModels()
 	for i, want := range []struct {
 		name string
 		ctx  int
 	}{
 		{"m · Opus", 500000},
 		{"m · Sonnet", 750000},
-		{"m1 · Haiku", 0},
 		{"unlisted/private-model · Fable", 0},
 	} {
 		if models[i]["display_name"] != want.name || want.ctx > 0 && models[i]["max_input_tokens"] != want.ctx {

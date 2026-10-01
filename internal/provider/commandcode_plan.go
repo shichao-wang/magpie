@@ -7,6 +7,11 @@ package provider
 // Anthropic's Messages) and billed against the plan's own credits and its
 // 5-hour and weekly limits, not as pay-as-you-go.
 //
+// Go has no API access: its key is only taken where the CLI itself asks,
+// POST /alpha/generate, in the CLI's own format (the gateway's
+// commandcode.go). Which plan an account is on is asked of billing/
+// subscriptions, and kept a while (cmdPlanNow).
+//
 // The CLI's own account is read, never changed, from ~/.commandcode/
 // auth.json. Further accounts are signed in by magpie with the CLI's own
 // browser sign-in: commandcode.ai/studio/auth/cli sends the new key to a
@@ -28,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -54,6 +60,141 @@ var cmdModels = []catalog.Model{
 	{ID: "zai-org/GLM-5.3", Name: "GLM-5.3", Context: 1_000_000},
 	{ID: "MiniMaxAI/MiniMax-M3", Name: "MiniMax M3", Context: 1_000_000},
 }
+
+// cmdGoModels are the models the Go plan is let use, as the CLI's own
+// table has it (1.73.0): every model its picker shows (wD, less the
+// hidden) but the "premium" ones and those it blocks for Go
+// (cmdGoRefused). They stand in until Command Code's list is fetched
+// (cmdGoFetch), and give that list the reasoning levels and pictures it
+// doesn't say.
+var cmdGoModels = []catalog.Model{
+	{ID: "gpt-6-luna", Name: "GPT-6 Luna", Context: 1_050_000, Images: true, Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "gpt-5.6-luna", Name: "GPT-5.6 Luna", Context: 1_050_000, Images: true, Efforts: []string{"low", "medium", "high", "xhigh", "max"}},
+	{ID: "deepseek/deepseek-v4-pro", Name: "DeepSeek V4 Pro", Context: 1_000_000, Efforts: []string{"high", "max"}},
+	{ID: "deepseek/deepseek-v4-flash", Name: "DeepSeek V4 Flash", Context: 1_000_000, Efforts: []string{"high", "max"}},
+	{ID: "deepseek/deepseek-v4-flash-vision-exp", Name: "DeepSeek V4 Flash Vision (exp)", Context: 1_000_000, Images: true, Efforts: []string{"high", "max"}},
+	{ID: "deepseek/deepseek-v4-flash-fast", Name: "DeepSeek V4 Flash Fast", Context: 1_000_000, Efforts: []string{"low", "high", "max"}},
+	{ID: "deepseek/deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash", Context: 1_000_000, Images: true, Efforts: []string{"low", "high", "max"}},
+	{ID: "deepseek/deepseek-v4.1-flash-fast", Name: "DeepSeek V4.1 Flash Fast", Context: 1_000_000, Images: true, Efforts: []string{"low", "high", "max"}},
+	{ID: "moonshotai/Kimi-K3", Name: "Kimi K3", Context: 1_000_000, Images: true, Efforts: []string{"low", "high", "max"}},
+	{ID: "moonshotai/Kimi-K2.7-Code", Name: "Kimi K2.7 Code", Context: 256_000, Images: true},
+	{ID: "moonshotai/Kimi-K2.7-Code-Highspeed", Name: "Kimi K2.7 Code HighSpeed", Context: 262_000, Images: true},
+	{ID: "moonshotai/Kimi-K2.6", Name: "Kimi K2.6", Context: 256_000, Images: true},
+	{ID: "moonshotai/Kimi-K2.5", Name: "Kimi K2.5", Context: 256_000, Images: true},
+	{ID: "z-ai/glm-5.3-flash", Name: "GLM-5.3 Flash", Context: 1_048_576, Images: true, Efforts: []string{"low", "high", "max"}},
+	{ID: "z-ai/glm-5.3-flashx", Name: "GLM-5.3 FlashX", Context: 1_000_000, Images: true, Efforts: []string{"low", "high", "max"}},
+	{ID: "zai-org/GLM-5.3", Name: "GLM-5.3", Context: 1_000_000, Efforts: []string{"low", "high", "max"}},
+	{ID: "zai-org/GLM-5.2", Name: "GLM-5.2", Context: 1_000_000, Efforts: []string{"high", "max"}},
+	{ID: "zai-org/GLM-5.2-Fast", Name: "GLM-5.2 Fast", Context: 1_000_000},
+	{ID: "zai-org/GLM-5.1", Name: "GLM-5.1", Context: 200_000},
+	{ID: "zai-org/GLM-5", Name: "GLM-5", Context: 200_000},
+	{ID: "MiniMaxAI/MiniMax-M3", Name: "MiniMax M3", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "high"}},
+	{ID: "MiniMaxAI/MiniMax-M2.7", Name: "MiniMax M2.7", Context: 200_000},
+	{ID: "MiniMaxAI/MiniMax-M2.5", Name: "MiniMax M2.5", Context: 200_000},
+	{ID: "xiaomi/mimo-v2.6-pro", Name: "MiMo V2.6 Pro", Context: 1_048_576, Images: true},
+	{ID: "xiaomi/mimo-v2.6-flash", Name: "MiMo V2.6 Flash", Context: 1_048_576, Images: true},
+	{ID: "xiaomi/mimo-v2.5-pro", Name: "MiMo V2.5 Pro", Context: 1_000_000},
+	{ID: "xiaomi/mimo-v2.5", Name: "MiMo V2.5", Context: 1_000_000, Images: true},
+	{ID: "Qwen/Qwen3.8-Omni-Flash", Name: "Qwen 3.8 Omni Flash", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "xhigh"}},
+	{ID: "Qwen/Qwen3.8-Max-0902", Name: "Qwen 3.8 Max 0902", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "xhigh"}},
+	{ID: "Qwen/Qwen3.8-Max", Name: "Qwen 3.8 Max", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "xhigh"}},
+	{ID: "Qwen/Qwen3.8-27B", Name: "Qwen 3.8 27B", Context: 262_144, Images: true, Efforts: []string{"low", "medium", "xhigh"}},
+	{ID: "Qwen/Qwen3.8-Flash", Name: "Qwen 3.8 Flash", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "xhigh"}},
+	{ID: "Qwen/Qwen3.7-Max", Name: "Qwen 3.7 Max", Context: 1_000_000},
+	{ID: "Qwen/Qwen3.7-Plus", Name: "Qwen 3.7 Plus", Context: 1_000_000, Images: true},
+	{ID: "Qwen/Qwen3.7-Flash", Name: "Qwen 3.7 Flash", Context: 1_000_000, Images: true},
+	{ID: "Qwen/Qwen3.6-Max-Preview", Name: "Qwen 3.6 Max Preview", Context: 200_000},
+	{ID: "Qwen/Qwen3.6-Plus", Name: "Qwen 3.6 Plus", Context: 200_000, Images: true},
+	{ID: "meituan/LongCat-2.0", Name: "LongCat 2.0", Context: 1_048_576},
+	{ID: "stepfun/Step-5-Preview", Name: "Step 5 Preview", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "high"}},
+	{ID: "stepfun/Step-3.7-Flash", Name: "Step 3.7 Flash", Context: 256_000, Images: true},
+	{ID: "stepfun/Step-3.5-Flash", Name: "Step 3.5 Flash", Context: 262_144},
+	{ID: "tencent/hy3-paid", Name: "Tencent Hy3", Context: 262_144},
+	{ID: "tencent/hy4-preview", Name: "Tencent Hy4 Preview", Context: 1_048_576, Efforts: []string{"low", "medium", "high"}},
+	{ID: "google/gemini-3.6-flash", Name: "Gemini 3.6 Flash", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "high"}},
+	{ID: "google/gemini-3.5-flash-lite", Name: "Gemini 3.5 Flash Lite", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "high"}},
+	{ID: "nvidia/nemotron-3-ultra-550b-a55b", Name: "Nemotron 3 Ultra", Context: 1_000_000},
+	{ID: "thinkingmachines/inkling", Name: "Inkling", Context: 256_000, Images: true},
+	{ID: "thinkingmachines/inkling-small", Name: "Inkling Small", Context: 1_000_000, Images: true},
+	{ID: "stealth/space-bunny-alpha", Name: "Space Bunny Alpha", Context: 1_000_000, Images: true, Efforts: []string{"low", "medium", "high"}},
+	{ID: "stealth/pixel-canary", Name: "Pixel Canary", Context: 262_144, Images: true, Efforts: []string{"low", "medium", "xhigh"}},
+	{ID: "poolside/laguna-s-2.1-free", Name: "Laguna S 2.1", Context: 256_000},
+	{ID: "inclusionai/ling-3.0-flash-free", Name: "Ling 3.0 Flash", Context: 256_000},
+	{ID: "inclusionai/ling-3.0-flash-sante:free", Name: "Ling 3.0 Flash Sante", Context: 262_144},
+	{ID: "inclusionai/ling-3.1-flash:free", Name: "Ling 3.1 Flash", Context: 262_144, Efforts: []string{"low", "medium", "high"}},
+	{ID: "meta/muse-spark-1.2-contributor", Name: "Muse Spark 1.2 Contributor", Context: 1_048_576, Images: true, Efforts: []string{"low", "medium", "high", "xhigh"}},
+	{ID: "meta/muse-spark-1.3-contributor", Name: "Muse Spark 1.3 Contributor", Context: 1_048_576, Images: true, Efforts: []string{"low", "medium", "high", "xhigh"}},
+	{ID: "xai/grok-4.5", Name: "Grok 4.5", Context: 500_000, Images: true, Efforts: []string{"low", "medium", "high"}},
+}
+
+// cmdGoRefused are the models of Command Code's list the Go plan is
+// refused, as the CLI's table has it (1.73.0): its "premium" ones, and
+// those "individual-go" blocks —
+//
+//	"individual-go":{allowedCategories:[qo],blockedModels:Xo=[…]}
+//
+// A model the table doesn't name the CLI lets any plan pick; one the plan
+// hasn't after all is refused with MODEL_NOT_IN_PLAN.
+var cmdGoRefused = map[string]bool{
+	// premium
+	"claude-sonnet-5": true, "claude-sonnet-4-6": true, "claude-fable-5-1": true, "claude-fable-5": true,
+	"claude-opus-5-5": true, "claude-opus-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
+	"claude-haiku-4-5-20251001": true, "gpt-6-astra": true, "gpt-6.1-sol": true, "gpt-6-sol": true,
+	"gpt-5.6-terra": true, "gpt-5.5": true, "gpt-5.4": true, "gpt-5.3-codex": true, "gpt-5.4-mini": true,
+	"google/gemini-3.5-flash": true, "google/gemini-3.1-flash-lite": true, "sakana/fugu-ultra": true,
+	"meta/muse-spark-1.1": true,
+	// blocked for Go
+	"claude-sonnet-5-5": true, "gpt-5.6-sol": true, "xai/grok-4.6": true, "xai/grok-4.7": true,
+	"meta/muse-spark-1.2": true, "meta/muse-spark-1.3": true, "xiaomi/mimo-v2.6-pro-ultraspeed": true,
+	"google/gemini-3.7-flash": true, "google/gemini-3.8-flash": true,
+}
+
+// cmdGoFetch is the Go plan's models: Command Code's list, less what Go
+// is refused. The list is the Provider API's, which answers without a key
+// (Go's has no Provider API), and takes its reasoning levels and pictures
+// from cmdGoModels.
+func cmdGoFetch(ctx context.Context) ([]catalog.Model, error) {
+	base := cmdAPI + "/provider/v1"
+	ms, err := catalog.FetchURL(ctx, base+"/models", "", false, nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []catalog.Model
+	for _, m := range catalog.Decorate(catalog.Chat(ms), cmdGoModels) {
+		if !cmdGoRefused[m.ID] {
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("Command Code listed no models for the Go plan")
+	}
+	cmdMarkFree(out)
+	return out, catalog.SaveLive(CommandCodePlanID, base, out)
+}
+
+// cmdFree are the models Command Code's CLI marks FREE in its picker
+// (1.73.2: badge:"free", "{name} is free and uses shared capacity"); its
+// API's list doesn't say so, and Space Bunny Alpha's and Pixel Canary's
+// ids name nothing free. Neither says a model is served at a discount.
+var cmdFree = map[string]bool{
+	"stealth/space-bunny-alpha": true, "stealth/pixel-canary": true,
+	"poolside/laguna-s-2.1-free": true, "inclusionai/ling-3.0-flash-free": true,
+	"inclusionai/ling-3.0-flash-sante:free": true, "inclusionai/ling-3.1-flash:free": true,
+	"MiniMaxAI/MiniMax-M3-Free": true, "minimax/minimax-m3-free": true,
+	"minimax/minimax-m2.7-free": true, "meituan/LongCat-2.0:free": true, "tencent/Hy3": true,
+}
+
+// cmdMarkFree marks the models of ms the CLI calls free, in place.
+func cmdMarkFree(ms []catalog.Model) []catalog.Model {
+	for i := range ms {
+		if cmdFree[ms[i].ID] {
+			ms[i].Free = true
+		}
+	}
+	return ms
+}
+
+func init() { cmdMarkFree(cmdGoModels) }
 
 // cmdAuth is an account's key, as auth.json and the sign-in name it.
 type cmdAuth struct {
@@ -138,7 +279,7 @@ func setCommandCodeLoginOn(user string, on bool) error {
 }
 
 func forgetCommandCodeLogin(user string) error {
-	return forgetSideLogin(CommandCodePlanID, user, "Command Code's own sign-in; sign out with cmd auth logout", cmdSide(), nil)
+	return forgetSideLogin(CommandCodePlanID, user, cmdSide(), nil)
 }
 
 func commandCodeAccount() (Provider, bool) {
@@ -164,23 +305,115 @@ func cmdProvider(who, plan string, a cmdAuth) Provider {
 	p := Provider{ID: CommandCodePlanID, Name: "Command Code Plan", Icon: "commandcode",
 		Chat: cmdAPI + "/provider/v1", Responses: cmdAPI + "/provider/v1", Anthropic: cmdAPI + "/provider",
 		Website: cmdStudio}
-	acct := &Account{Agent: CommandCodePlanID, User: who, Plan: plan}
+	acct := &Account{Agent: CommandCodePlanID, User: who, Plan: cmdPlanKnown(a, plan)}
 	acct.sign = func(ctx context.Context, req *http.Request, body []byte) error {
 		req.Header.Del("Authorization")
 		req.Header.Set("Authorization", "Bearer "+a.APIKey)
 		req.Header.Set("x-api-key", a.APIKey)
 		return nil
 	}
-	acct.models = func() []catalog.Model { return cmdModels }
+	acct.models = func() []catalog.Model {
+		if cmdPlanKnown(a, plan) == "Go" {
+			return cmdGoModels
+		}
+		return cmdModels
+	}
 	// the plan's list is the Provider API's, with what each model is
-	// served on; it is asked as a keyed provider's is
+	// served on; it is asked as a keyed provider's is. Go's key has no
+	// Provider API: its list is the same one, asked without it, less what
+	// Go is refused.
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
+		if cmdPlanNow(ctx, a, plan) == "Go" {
+			return cmdGoFetch(ctx)
+		}
 		keyed := p
 		keyed.Account, keyed.Key = nil, a.APIKey
-		return keyed.Fetch(ctx)
+		ms, base, err := keyed.fetchOne(keyed.Via(ctx))
+		if err != nil {
+			return nil, err
+		}
+		cmdMarkFree(ms)
+		return catalog.Chat(ms), catalog.SaveLive(p.ID, base, ms)
+	}
+	acct.generate = func(ctx context.Context) (string, bool) {
+		return a.APIKey, cmdPlanNow(ctx, a, plan) == "Go"
 	}
 	p.Account = acct
 	return p
+}
+
+// CommandCodeGenerate says whether p is a Command Code account on the Go
+// plan, which is asked at api+"/alpha/generate" in the CLI's own format
+// rather than on the Provider API, with key; ok is false for every other
+// account and provider.
+func CommandCodeGenerate(ctx context.Context, p Provider) (api, key string, ok bool) {
+	if p.Account == nil || p.Account.generate == nil {
+		return "", "", false
+	}
+	if key, ok = p.Account.generate(ctx); !ok {
+		return "", "", false
+	}
+	return cmdAPI, key, true
+}
+
+// ---- which plan ---------------------------------------------------------------
+
+// cmdPlansSeen is each key's plan, as billing/subscriptions last said
+// ("" when it couldn't be read), and when.
+var cmdPlansSeen = struct {
+	sync.Mutex
+	m map[string]cmdSeen
+}{m: map[string]cmdSeen{}}
+
+type cmdSeen struct {
+	plan string
+	at   time.Time
+}
+
+// How long a plan read is kept, and a failure to read it before it is
+// asked again.
+var (
+	cmdPlanKeep  = 10 * time.Minute
+	cmdPlanRetry = time.Minute
+)
+
+// cmdRemember keeps what billing/subscriptions said of a key's plan.
+func cmdRemember(key, plan string) {
+	cmdPlansSeen.Lock()
+	cmdPlansSeen.m[key] = cmdSeen{plan, time.Now()}
+	cmdPlansSeen.Unlock()
+}
+
+// cmdPlanKnown is the account's plan as last read, else saved (the one
+// its sign-in said), asking no one.
+func cmdPlanKnown(a cmdAuth, saved string) string {
+	cmdPlansSeen.Lock()
+	seen := cmdPlansSeen.m[a.APIKey]
+	cmdPlansSeen.Unlock()
+	return firstNonEmpty(seen.plan, saved)
+}
+
+// cmdPlanNow is the account's plan, read again once what was read is
+// older than cmdPlanKeep; saved while it can't be read. The CLI's own
+// account has none saved, so it is always asked.
+func cmdPlanNow(ctx context.Context, a cmdAuth, saved string) string {
+	cmdPlansSeen.Lock()
+	seen, ok := cmdPlansSeen.m[a.APIKey]
+	cmdPlansSeen.Unlock()
+	switch {
+	case ok && seen.plan != "" && time.Since(seen.at) < cmdPlanKeep:
+		return seen.plan
+	case ok && seen.plan == "" && time.Since(seen.at) < cmdPlanRetry:
+		return saved
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, plan, _, _, read := cmdSubscription(ctx, a)
+	if !read {
+		plan = ""
+	}
+	cmdRemember(a.APIKey, plan)
+	return firstNonEmpty(plan, saved)
 }
 
 // ---- allowance ----------------------------------------------------------------
@@ -351,6 +584,7 @@ func cmdQuota(ctx context.Context, l Login, a cmdAuth) SubscriptionQuota {
 	}
 	if planOK {
 		q.Plan, q.Until, q.Renew = plan, until, renew
+		cmdRemember(a.APIKey, plan)
 	}
 	return q
 }
@@ -364,14 +598,15 @@ const cmdNoPlan = "No plan"
 // none. ok is false when that can't be read.
 func cmdSubscription(ctx context.Context, a cmdAuth) (id, plan string, until *time.Time, renew string, ok bool) {
 	var r struct {
-		Data *struct {
+		Success *bool `json:"success"` // false when Command Code couldn't tell ("write CONNECTION_CLOSED …"), though a 200
+		Data    *struct {
 			PlanID           string `json:"planId"`
 			Status           string `json:"status"`
 			CurrentPeriodEnd any    `json:"currentPeriodEnd"`
 			CancelAtEnd      *bool  `json:"cancelAtPeriodEnd"`
 		} `json:"data"`
 	}
-	if accountJSON(ctx, cmdAPI+"/alpha/billing/subscriptions", a.APIKey, nil, &r) != nil {
+	if accountJSON(ctx, cmdAPI+"/alpha/billing/subscriptions", a.APIKey, nil, &r) != nil || (r.Success != nil && !*r.Success) {
 		return "", "", nil, "", false
 	}
 	if d := r.Data; d != nil && d.PlanID != "" && d.Status != "canceled" && d.Status != "incomplete_expired" {

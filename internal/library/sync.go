@@ -17,6 +17,9 @@ type Result struct {
 	// fetched again and the ones that couldn't be (What is skill:<name>)
 	Updated   []string  `json:"updated,omitempty"`
 	Unupdated []Problem `json:"unupdated,omitempty"`
+	// Unimported are, for skills brought in together, the ones that
+	// couldn't be (What is skill:<name>)
+	Unimported []Problem `json:"unimported,omitempty"`
 }
 
 // Problem is one thing that couldn't be given to an agent.
@@ -24,6 +27,9 @@ type Problem struct {
 	Agent string `json:"agent"`
 	What  string `json:"what"` // instructions, mcp:<name>, skill:<name>
 	Error string `json:"error"`
+	// Own is a skill the agent has a folder of its own for, not the
+	// library's: the page offers to use the library's or keep the agent's
+	Own bool `json:"own,omitempty"`
 }
 
 func (r *Result) changed(agent string) {
@@ -47,7 +53,16 @@ func (l *Library) sync() *Result {
 	for _, t := range all {
 		l.syncInstructions(t, b, res)
 		l.syncMCP(t, b, res)
-		l.syncSkills(t, res, all)
+	}
+	// ~/.agents/skills first: an agent that reads it too gets no second
+	// link to what is there already
+	shared := realDir(sharedSkillsDir())
+	for _, first := range []bool{true, false} {
+		for _, t := range all {
+			if (t.Skills != "" && realDir(t.Skills) == shared) == first {
+				l.syncSkills(t, res, all)
+			}
+		}
 	}
 	l.syncProjects(res)
 	res.Backup = b.dir
@@ -69,6 +84,11 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 	}
 	id := t.Agent.ID
 	a := l.applied(id)
+	// an agent given no server, with none of magpie's in it, isn't read:
+	// a file of its that can't be read is nothing the library did
+	if len(a.MCP) == 0 && !slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) }) {
+		return
+	}
 	entries, err := t.MCP.entries()
 	if err != nil {
 		res.fail(id, "mcp", err)
@@ -93,7 +113,7 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 		if s := l.server(name); s != nil && slices.Contains(s.Agents, id) && t.MCP.supports(s) == nil {
 			continue
 		}
-		if _, ok := entries[name]; ok && !write("mcp:"+name, func() error { return t.MCP.del(name) }) {
+		if _, ok := entries[name]; (ok || t.MCP.holds(name)) && !write("mcp:"+name, func() error { return t.MCP.del(name) }) {
 			mine = append(mine, name)
 		}
 	}
@@ -107,7 +127,7 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 		}
 		old := entries[s.Name]
 		if old != nil {
-			if cur, ok := t.MCP.decode(s.Name, old); ok && cur.same(s) && t.MCP.has(s) {
+			if cur, ok := t.MCP.decode(s.Name, old); ok && cur.same(s) && t.MCP.has(s) && !t.MCP.behind(s, old) {
 				mine = append(mine, s.Name)
 				continue
 			}
@@ -300,7 +320,12 @@ func RemoveServer(name string) (*Result, error) {
 		if i < 0 {
 			return fmt.Errorf("no server called %s", name)
 		}
+		k := serverKey(l.MCP[i])
 		l.MCP = slices.Delete(l.MCP, i, i+1)
+		// its icon goes with it, unless another server runs the same thing
+		if !slices.ContainsFunc(l.MCP, func(x *Server) bool { return serverKey(x) == k }) {
+			delete(l.Icons, k)
+		}
 		return nil
 	})
 }

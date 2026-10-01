@@ -18,6 +18,8 @@ import (
 	"github.com/yetone/magpie/internal/imagemcp"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/profile"
+	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/tui"
 	"github.com/yetone/magpie/internal/update"
@@ -29,6 +31,7 @@ const usage = `magpie — one place to pick every agent's model
 
   magpie                          open the app: a window plus a menu bar icon
   magpie tray                     start in the menu bar only
+  magpie panel                    open the menu bar icon's quick panel, or close it
   magpie autostart [on|off]       open magpie (in the menu bar) when you log in, or say whether it does
   magpie tui                      the same thing, in the terminal
   magpie web [--addr host:port] [--lan] [--no-open]
@@ -48,6 +51,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie backup [--no-keys] [--no-library] [file]    providers, keys, settings, profiles, agent models and the library in one file, sealed with a passphrase
   magpie restore [--no-agents] [--no-library] <file> put a backup in on this machine
   magpie webdav [on <address>|set k=v…|now|off]      the same, kept the same on every computer through a WebDAV folder (magpie webdav help)
+  magpie s3 [on s3://<bucket>[/<prefix>]|set k=v…|now|off]   the same through an S3-compatible bucket: AWS, R2, B2, MinIO… (magpie s3 help)
 
   magpie library [sync|instructions|mcp|skill]   the instructions, MCP servers and skills written into every agent (magpie library help)
 
@@ -69,12 +73,17 @@ const usage = `magpie — one place to pick every agent's model
   magpie accounts [agent] [--json]  every subscription magpie knows, with each one's allowance used and when it resets
   magpie accounts add <agent>     sign in to one more Claude, ChatGPT or Google (Gemini CLI, Antigravity) subscription
   magpie accounts switch <agent> <email>   sign the agent in to another of them
-  magpie accounts refresh         renew the saved Claude and ChatGPT sign-ins now (the gateway does it daily)
+  magpie accounts refresh         renew the saved ChatGPT sign-ins now (the gateway does it daily)
   magpie accounts checkin         WorkBuddy's daily check-in (签到) for each WorkBuddy account, now (Settings can do it daily)
   magpie accounts project <gemini|antigravity> <email> <project>   the Google Cloud project a Google account's requests go to
+  magpie plugin [add <package>|rm|update|on|off|login <provider>|logout <provider>]
+                                  OpenCode provider plugins: subscriptions signed in to, and served, through a plugin
+  magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
+  magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts
 
   magpie serve                    run the gateway alone (the app runs it too)
-  magpie mcp image                the image generation MCP server an agent is given from the library (stdio)
+  magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
+  magpie mcp image                the image and video generation MCP server an agent is given from the library (stdio)
   magpie usage [today|7d|30d|all] tokens and cost per agent and model (30d)
   magpie usage --csv [today|7d|30d|all]   every request as CSV: the model asked for, sent and served, tokens, cost, time, status
   magpie sessions [--model <m>] [--folder <f>] [--json]   the latest Claude Code, Codex, OpenCode and Pi sessions, with what each cost
@@ -96,16 +105,26 @@ var (
 )
 
 func main() {
+	if provider.TookOpenedURL(os.Args[1:]) {
+		// Claude Code, signing in for magpie, handed over the page to open
+		return
+	}
 	gateway.Version = version
 	netproxy.Install()
 	update.GUI = hasGUI
-	if err := run(os.Args[1:]); err != nil {
+	err := run(os.Args[1:])
+	sessions.Saved() // the session index kept, for the next run
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "magpie:", err)
 		os.Exit(1)
 	}
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "healthcheck" {
+		return healthcheck() // every few seconds in a container: nothing else
+	}
+	makeDirs()
 	settings.Migrate()
 	agent.RenameLegacy()
 	agent.MoveCursorEfforts()
@@ -120,6 +139,13 @@ func run(args []string) error {
 	gateway.DesktopTiers = agent.DesktopTiers
 	// the setup kept the same on every computer, by whichever serves
 	gateway.WhileServing = append(gateway.WhileServing, davsync.Run)
+	// and the request archive, when it is on, goes to the bucket sync is to
+	gateway.ArchiveBucket = func() (gateway.Putter, bool) {
+		if b, ok := davsync.S3Bucket(); ok {
+			return b, true
+		}
+		return nil, false
+	}
 	if len(args) == 0 {
 		if hasGUI {
 			return runGUI(true, "")
@@ -140,9 +166,21 @@ func run(args []string) error {
 	case "web":
 		return webCmd(args[1:])
 	case "app", "gui":
+		// `magpie gui settings`: the window on that tab, as a restart to
+		// update from it comes back (update.RelaunchArgs)
+		if len(args) > 1 {
+			return runWindow(args[1])
+		}
 		return runGUI(true, "")
 	case "tray":
 		return runGUI(false, "")
+	case "-Embedding":
+		// Windows starting magpie for a click on one of its notifications
+		// (a usage alert, #368) left in the Action Center after it quit:
+		// the window, on the Usage page
+		return runWindow("usage")
+	case "panel":
+		return runPanel()
 	case "autostart":
 		return autostartCmd(args[1:])
 	case "-h", "--help", "help":
@@ -206,6 +244,10 @@ func run(args []string) error {
 		return restoreCmd(args[1:])
 	case "webdav", "dav":
 		return webdavCmd(args[1:])
+	case "plugin", "plugins":
+		return pluginCmd(args)
+	case "s3":
+		return s3Cmd(args[1:])
 	case "mcp":
 		return imagemcp.Run(args[1:])
 	case "claude-mcp-helper": // internal: stdio MCP subprocess spawned by Claude Code
@@ -270,7 +312,7 @@ func set(a *agent.Agent, key, value string) error {
 	// value it had already is said to be so
 	now := f.Get()
 	shown := now
-	if value == "" {
+	if value == "" || now == "" {
 		shown = muted.Render("default")
 	}
 	if now == before {
@@ -287,6 +329,16 @@ func set(a *agent.Agent, key, value string) error {
 
 func fieldForValue(a *agent.Agent, v string) *agent.Field {
 	vals := a.Values()
+	// the agent's suffix after a model (omp's ":max") aside: a role on the
+	// same model at that level offers it as typed, and would take it. A list
+	// of models no picker offers: it is for the model
+	if a.SplitSuffix != nil {
+		m, _, one := a.SplitSuffix(v)
+		if !one {
+			return nil
+		}
+		v = m
+	}
 	// a model stays with the model, even where other fields offer it too
 	// (Claude Code's opus/sonnet/haiku/fable)
 	for _, o := range a.Fields[0].Options(vals) {

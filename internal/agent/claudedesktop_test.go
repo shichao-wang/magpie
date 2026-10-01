@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/gateway"
@@ -262,6 +263,52 @@ func TestClaudeDesktopTiers(t *testing.T) {
 	}
 	if err := a.Field("provider").Set("magpie"); err != nil || a.Field("opus").Get() != "" {
 		t.Fatalf("reconnect revived a cleared tier: %v, value %q", err, a.Field("opus").Get())
+	}
+}
+
+func TestClaudeDesktopNoticeOnlyProvider(t *testing.T) {
+	home, _ := desktopSandbox(t)
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
+		t.Fatal(err)
+	}
+	a := claudeDesktop(home)
+	if got := a.Notice(); got != "" {
+		t.Fatalf("fresh agent notice: %q", got)
+	}
+	connect := func() {
+		t.Helper()
+		if err := a.Field("provider").Set("magpie"); err != nil {
+			t.Fatal(err)
+		}
+		if got := a.Notice(); !strings.Contains(got, "quit and reopen") {
+			t.Fatalf("provider change has no restart notice: %q", got)
+		}
+	}
+	quiet := func(tier, value string, wantErr bool) {
+		t.Helper()
+		err := a.Field(tier).Set(value)
+		if (err != nil) != wantErr {
+			t.Fatalf("%s = %q: %v, want error %v", tier, value, err, wantErr)
+		}
+		if got := a.Notice(); got != "" {
+			t.Fatalf("%s = %q retained provider notice: %q", tier, value, got)
+		}
+	}
+	for _, tier := range claudeTiers {
+		connect()
+		quiet(tier, "deepseek/pro", false)
+		connect()
+		quiet(tier, "", false)
+		connect()
+		quiet(tier, "not-a-model", true)
+		if err := a.Field("provider").Set(""); err != nil {
+			t.Fatal(err)
+		}
+		if got := a.Notice(); !strings.Contains(got, "sign in with Anthropic again") {
+			t.Fatalf("provider off has no restart notice: %q", got)
+		}
+		quiet(tier, "", false)
+		quiet(tier, "deepseek/pro", true)
 	}
 }
 

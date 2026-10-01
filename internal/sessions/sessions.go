@@ -1,10 +1,10 @@
 // Package sessions lists the agents' recent sessions from their own session
 // files — Claude Code's projects/*/<id>.jsonl (and Qoder's, the same kind),
 // Codex's rollout files, OpenCode's database (or its older JSON files) and
-// ZCode's, Pi's session files, DeepSeek Harness's, Cline's, Grok Build's and
-// WorkBuddy's — with the
-// tokens each spent, what that cost at list price, and the command that
-// resumes it. It only ever reads the agents' folders.
+// ZCode's, Pi's session files and omp's, DeepSeek Harness's, Cline's, Grok
+// Build's and WorkBuddy's — with the tokens each spent, what that cost at the
+// effective price, and the command that resumes it. It only ever reads the
+// agents' folders.
 //
 // The files grow long (hundreds of MB), so each one's parse is kept by path,
 // size and time, and a file that only grew is read on from where it was left.
@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -25,10 +26,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Tokens is a count of tokens. Input excludes what was read from cache.
@@ -65,7 +68,7 @@ type Model struct {
 
 // Session is one agent session.
 type Session struct {
-	Agent  string    `json:"agent"` // magpie agent id: claude, codex, opencode, pi, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy
+	Agent  string    `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy
 	ID     string    `json:"id"`
 	Cwd    string    `json:"cwd"`
 	Title  string    `json:"title"` // the first prompt, else the agent's own title
@@ -73,13 +76,15 @@ type Session struct {
 	Last   time.Time `json:"last"`
 	Models []Model   `json:"models"`
 	Tokens
-	Cost     float64 `json:"cost"`     // USD at list price, for the priced models
+	Cost     float64 `json:"cost"`     // USD at the effective price, for the priced models
 	Unpriced int     `json:"unpriced"` // models that spent tokens but have no known price
 	Resume   string  `json:"resume"`   // the command that picks the session up again
 	Path     string  `json:"path"`     // its (main) file
 }
 
-// PriceOf is the list price of a model as a session names it. Tests swap it.
+// PriceOf is the effective price of a model as a session names it, at the
+// settings given. Tests swap it; the settings are the ones the listing read,
+// so a swapped one prices against the same copy as the default does.
 var PriceOf = priceOf
 
 // Limit is how many sessions, the latest by last activity, List reads.
@@ -87,17 +92,20 @@ const Limit = 200
 
 // state is what one file's parse has come to, enough to read on from Off.
 type state struct {
-	Size   int64             `json:"size"`
-	Mod    int64             `json:"mod"` // unix nanoseconds
-	Off    int64             `json:"off"` // after the last whole line read
-	ID     string            `json:"id,omitempty"`
-	Cwd    string            `json:"cwd,omitempty"`
-	Title  string            `json:"title,omitempty"`
-	Named  string            `json:"named,omitempty"` // the agent's own title for it
-	First  string            `json:"first,omitempty"` // the first message, when no prompt looked typed
-	Start  time.Time         `json:"start"`
-	Last   time.Time         `json:"last"`
-	Models map[string]Tokens `json:"models,omitempty"`
+	Head        string            `json:"head,omitempty"`
+	HeadSize    int               `json:"head_size,omitempty"`
+	ContentHash string            `json:"content_hash,omitempty"`
+	Size        int64             `json:"size"`
+	Mod         int64             `json:"mod"` // unix nanoseconds
+	Off         int64             `json:"off"` // after the last whole line read
+	ID          string            `json:"id,omitempty"`
+	Cwd         string            `json:"cwd,omitempty"`
+	Title       string            `json:"title,omitempty"`
+	Named       string            `json:"named,omitempty"` // the agent's own title for it
+	First       string            `json:"first,omitempty"` // the first message, when no prompt looked typed
+	Start       time.Time         `json:"start"`
+	Last        time.Time         `json:"last"`
+	Models      map[string]Tokens `json:"models,omitempty"`
 	// Days is Models again, split by the local date each message was
 	// written on: a session that runs past midnight counts on both days.
 	Days map[string]*day `json:"days,omitempty"`
@@ -125,6 +133,38 @@ type day struct {
 	// again next week) counts nothing. A subagent's file counts none, as
 	// it runs while its session's own file goes on.
 	Active int64 `json:"a,omitempty"`
+	// Hours is Active again, by the local hour of the day it was put on
+	// (24 of them, or none)
+	Hours []int64 `json:"h,omitempty"`
+	// Prompts are the messages typed in the session's own file, Replies
+	// the agent's messages back (Claude Code's, Codex's, Pi's and omp's)
+	Prompts int `json:"u,omitempty"`
+	Replies int `json:"r,omitempty"`
+	// Tools are the tool calls made, by the tool's name, and Skills the
+	// skills called up, by the skill's (subagents' files included)
+	Tools  map[string]int `json:"t,omitempty"`
+	Skills map[string]int `json:"k,omitempty"`
+}
+
+// tool counts a call of a tool, and of a skill when it calls one up; a
+// skill called up with no tool (Pi's /skill:name) has no name.
+func (s *state) tool(at time.Time, name, skill string) {
+	if name == "" && skill == "" {
+		return
+	}
+	d := s.day(dateOf(at))
+	if name != "" {
+		if d.Tools == nil {
+			d.Tools = map[string]int{}
+		}
+		d.Tools[name]++
+	}
+	if skill != "" {
+		if d.Skills == nil {
+			d.Skills = map[string]int{}
+		}
+		d.Skills[skill]++
+	}
 }
 
 // idleGap is the longest pause between two lines still counted as work.
@@ -195,7 +235,12 @@ func (s *state) saw(t time.Time, main bool) {
 	}
 	if t.After(s.Last) {
 		if gap := t.Sub(s.Last); main && !s.Last.IsZero() && gap < idleGap {
-			s.day(dateOf(t)).Active += gap.Milliseconds()
+			d := s.day(dateOf(t))
+			d.Active += gap.Milliseconds()
+			if d.Hours == nil {
+				d.Hours = make([]int64, 24)
+			}
+			d.Hours[t.In(time.Local).Hour()] += gap.Milliseconds()
 		}
 		s.Last = t
 	}
@@ -213,7 +258,16 @@ func (s *state) clone() *state {
 	}
 	c.Days = make(map[string]*day, len(s.Days))
 	for k, v := range s.Days {
-		d := &day{Active: v.Active, Models: make(map[string]Tokens, len(v.Models))}
+		d := &day{Active: v.Active, Models: make(map[string]Tokens, len(v.Models)), Prompts: v.Prompts, Replies: v.Replies}
+		if v.Hours != nil {
+			d.Hours = append([]int64(nil), v.Hours...)
+		}
+		if v.Tools != nil {
+			d.Tools = maps.Clone(v.Tools)
+		}
+		if v.Skills != nil {
+			d.Skills = maps.Clone(v.Skills)
+		}
 		for m, t := range v.Models {
 			d.Models[m] = t
 		}
@@ -273,18 +327,29 @@ func claudeFiles() []file { return ccFiles("claude", ClaudeDir()) }
 func ccFiles(agent, dir string) []file {
 	projects := filepath.Join(dir, "projects")
 	var out []file
-	mains, _ := filepath.Glob(filepath.Join(projects, "*", "*.jsonl"))
-	for _, p := range mains {
-		f := file{agent: agent, key: agent + ":" + strings.TrimSuffix(filepath.Base(p), ".jsonl"), path: p, main: true}
-		if stat(&f) {
-			out = append(out, f)
+	for _, project := range readDirectory(projects) {
+		if !project.IsDir() && project.Type()&os.ModeSymlink == 0 {
+			continue
 		}
-	}
-	subs, _ := filepath.Glob(filepath.Join(projects, "*", "*", "subagents", "*.jsonl"))
-	for _, p := range subs {
-		f := file{agent: agent, key: agent + ":" + filepath.Base(filepath.Dir(filepath.Dir(p))), path: p}
-		if stat(&f) {
-			out = append(out, f)
+		root := filepath.Join(projects, project.Name())
+		for _, e := range readDirectory(root) {
+			path := filepath.Join(root, e.Name())
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+				f := file{agent: agent, key: agent + ":" + strings.TrimSuffix(e.Name(), ".jsonl"), path: path, main: true}
+				if stat(&f) {
+					out = append(out, f)
+				}
+			} else if e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+				for _, sub := range readDirectory(filepath.Join(path, "subagents")) {
+					if sub.IsDir() || !strings.HasSuffix(sub.Name(), ".jsonl") {
+						continue
+					}
+					f := file{agent: agent, key: agent + ":" + e.Name(), path: filepath.Join(path, "subagents", sub.Name())}
+					if stat(&f) {
+						out = append(out, f)
+					}
+				}
+			}
 		}
 	}
 	return out
@@ -293,9 +358,9 @@ func ccFiles(agent, dir string) []file {
 // allFiles are every agent's session files.
 func allFiles() []file {
 	var out []file
-	for _, fs := range [][]file{claudeFiles(), codexFiles(), openCodeFiles(), piFiles(),
+	for _, fs := range [][]file{callFiles(), openCodeFiles(), piFiles(),
 		zcodeFiles(), dshFiles(), clineFiles(), ccFiles("qoder", QoderDir("qoder")), ccFiles("qoder-cn", QoderDir("qoder-cn")),
-		grokFiles(), workbuddyFiles()} {
+		grokFiles(), workbuddyFiles(), ompFiles()} {
 		out = append(out, fs...)
 	}
 	return out
@@ -315,6 +380,7 @@ func Dirs() []string {
 		{QoderDir("qoder-cn"), filepath.Join(QoderDir("qoder-cn"), "projects")},
 		{GrokDir(), filepath.Join(GrokDir(), "sessions")},
 		{WorkBuddyDir(), filepath.Join(WorkBuddyDir(), "projects")},
+		{OmpDir(), filepath.Join(OmpDir(), "sessions")},
 	} {
 		if _, err := os.Stat(d.sessions); err == nil {
 			out = append(out, d.dir)
@@ -348,9 +414,12 @@ func codexFiles() []file {
 }
 
 var (
-	mu     sync.Mutex
-	cache  map[string]*state // path → parse
-	loaded bool
+	// DB readers share connection lifetimes; call-file readers need only mu.
+	dbReadMu        sync.Mutex
+	mu              sync.Mutex
+	cache           map[string]*state // path → parse
+	loaded          bool
+	cacheGeneration uint64
 	// the zone the parses in memory date their days in
 	cacheZone string
 )
@@ -361,7 +430,15 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // cacheVersion changes when a parse would come out differently, so the
 // parses kept by an older magpie are read again.
 // 2: each file's usage by day, and its active time
-const cacheVersion = 2
+// 3: the active time by hour of the day
+// 4: the tool calls and skills a day
+// 5: again, for the prompts and replies a day, which an early 4 left out
+// 6: per-call metadata and continuation share the session file scan
+// 7: Codex's recorded provider and creator identity
+// 8: keep only summaries here; request metadata has per-file shards.
+// 9: validate the previous full prefix before treating growth as an append.
+// 10: Pi's and omp's prompts, replies, tool calls and skills.
+const cacheVersion = 10
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -384,19 +461,85 @@ func loadCache() {
 		return
 	}
 	loaded, cacheZone = true, z
+	cacheGeneration++
 	cache = map[string]*state{}
+	saved() // the kept file as the last save left it
 	var c cacheFile
 	if b, err := os.ReadFile(CachePath()); err == nil && json.Unmarshal(b, &c) == nil && c.Version == cacheVersion && c.Zone == z && c.Files != nil {
 		cache = c.Files
 	}
 }
 
+// saveCache keeps the parses on disk. Writing the whole index (tens of MB
+// for a long history) takes a second or more, so it is done behind the
+// request: the parses in the cache are never changed once put there (a new
+// parse starts from a clone), so a copy of the map is a snapshot; saves in a
+// row are folded into the latest.
 func saveCache() {
-	b, err := json.Marshal(cacheFile{Version: cacheVersion, Zone: zone(), Files: cache})
+	snap := save{cacheFile{Version: cacheVersion, Zone: zone(), Files: maps.Clone(cache)}, CachePath()}
+	saving.Lock()
+	defer saving.Unlock()
+	saving.next = &snap
+	if saving.running {
+		return
+	}
+	saving.running = true
+	go func() {
+		for {
+			saving.Lock()
+			f := saving.next
+			saving.next = nil
+			if f == nil {
+				saving.running = false
+				saving.Broadcast()
+				saving.Unlock()
+				return
+			}
+			saving.Unlock()
+			writeCache(f)
+		}
+	}()
+}
+
+var saving struct {
+	sync.Mutex
+	*sync.Cond
+	running bool
+	next    *save
+}
+
+type save struct {
+	cacheFile
+	path string
+}
+
+func init() { saving.Cond = sync.NewCond(&saving.Mutex) }
+
+// Saved waits for the index being saved, so a process about to end leaves
+// it on disk.
+func Saved() { saved() }
+
+// saved waits for the saves under way.
+func saved() {
+	saving.Lock()
+	for saving.running {
+		saving.Wait()
+	}
+	saving.Unlock()
+}
+
+// saveHook, when a test sets it, runs before each save is written.
+var saveHook func()
+
+func writeCache(c *save) {
+	if saveHook != nil {
+		saveHook()
+	}
+	b, err := json.Marshal(c.cacheFile)
 	if err != nil {
 		return
 	}
-	dir := filepath.Dir(CachePath())
+	dir := filepath.Dir(c.path)
 	if os.MkdirAll(dir, 0o755) != nil {
 		return
 	}
@@ -408,7 +551,7 @@ func saveCache() {
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
-	if err != nil || os.Rename(tmp.Name(), CachePath()) != nil {
+	if err != nil || os.Rename(tmp.Name(), c.path) != nil {
 		os.Remove(tmp.Name())
 	}
 }
@@ -442,41 +585,134 @@ func refresh(want, all []file) {
 		}
 		return
 	}
+	// the biggest first, so no long file is left to run on alone at the
+	// end; and twice the cores, as the reading waits on the disk
+	sort.Slice(todo, func(i, j int) bool { return todo[i].size-offOf(todo[i]) > todo[j].size-offOf(todo[j]) })
+	left := make(map[string]int64, len(todo))
+	var total int64
+	for _, f := range todo {
+		left[f.path] = f.size - offOf(f)
+		total += left[f.path]
+	}
+	progress.start(len(todo), total)
+	type job struct {
+		f      file
+		old    *state
+		parsed *state
+	}
+	jobs := make([]job, len(todo))
+	for i, f := range todo {
+		jobs[i] = job{f: f, old: cache[f.path]}
+	}
+	generation := cacheGeneration
+	mu.Unlock()
 	var wg sync.WaitGroup
-	var put sync.Mutex
-	ch := make(chan file)
-	for i := 0; i < min(max(4, runtime.NumCPU()/2), len(todo)); i++ {
+	ch := make(chan int)
+	for i := 0; i < min(max(8, 2*runtime.NumCPU()), 32, len(todo)); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for f := range ch {
-				put.Lock()
-				old := cache[f.path]
-				put.Unlock()
-				s := parse(f, old)
-				put.Lock()
-				cache[f.path] = s
-				put.Unlock()
+			for i := range ch {
+				j := &jobs[i]
+				j.parsed = parse(j.f, j.old)
+				progress.files.Add(1)
+				progress.read.Add(left[j.f.path])
 			}
 		}()
 	}
-	for _, f := range todo {
-		ch <- f
+	for i := range jobs {
+		ch <- i
 	}
 	close(ch)
 	wg.Wait()
-	saveCache()
+	mu.Lock()
+	for _, j := range jobs {
+		// A concurrent read may already have published a newer parse.
+		if generation == cacheGeneration && cache[j.f.path] == j.old {
+			cache[j.f.path] = j.parsed
+		}
+	}
+	progress.finish()
+	if generation == cacheGeneration {
+		saveCache()
+	}
 }
 
-// pricer looks up the price of each model once.
+// progress is how far the reading of changed files has got, for the page to
+// show while it waits: files and bytes read of those to read.
+var progress indexing
+
+type indexing struct {
+	guard       sync.Mutex
+	active      int
+	on          atomic.Bool
+	files, read atomic.Int64
+	todo, bytes atomic.Int64
+}
+
+func (p *indexing) start(n int, total int64) {
+	p.guard.Lock()
+	defer p.guard.Unlock()
+	if p.active == 0 {
+		p.files.Store(0)
+		p.read.Store(0)
+		p.todo.Store(int64(n))
+		p.bytes.Store(total)
+	} else {
+		p.todo.Add(int64(n))
+		p.bytes.Add(total)
+	}
+	p.active++
+	p.on.Store(true)
+}
+
+func (p *indexing) finish() {
+	p.guard.Lock()
+	defer p.guard.Unlock()
+	p.active--
+	p.on.Store(p.active > 0)
+}
+
+// Progress is how far the sessions being read have got; Indexing is false
+// when none are.
+type Progress struct {
+	Indexing bool  `json:"indexing"`
+	Files    int64 `json:"files"`
+	Done     int64 `json:"done"`
+	Bytes    int64 `json:"bytes"`
+	Read     int64 `json:"read"`
+}
+
+// Indexing is the reading's progress.
+func Indexing() Progress {
+	p := &progress
+	return Progress{Indexing: p.on.Load(), Files: p.todo.Load(), Done: p.files.Load(), Bytes: p.bytes.Load(), Read: min(p.read.Load(), p.bytes.Load())}
+}
+
+// offOf is where the parse kept of f left off.
+func offOf(f file) int64 {
+	if s := cache[f.path]; s != nil && s.Off <= f.size {
+		return s.Off
+	}
+	return 0
+}
+
+// pricer looks up the price of each model once, out of one read of the
+// settings: a listing names the same handful of models over and over, and
+// each of them otherwise read the file and parsed it again. Every model is
+// priced against the copy read here, so a listing is one snapshot of the
+// prices rather than a reading per row, and a price changed while it is
+// read takes effect in the next listing rather than halfway through this
+// one.
 func pricer() func(string) *catalog.Price {
 	prices := map[string]*catalog.Price{}
+	s := settings.Load()
 	return func(model string) *catalog.Price {
 		if p, ok := prices[model]; ok {
 			return p
 		}
 		var pp *catalog.Price
-		if p, ok := PriceOf(model); ok {
+		if p, ok := PriceOf(s, model); ok {
 			pp = &p
 		}
 		prices[model] = pp
@@ -486,14 +722,22 @@ func pricer() func(string) *catalog.Price {
 
 // Reset forgets the kept parses, in memory only.
 func Reset() {
+	directoryCache.Lock()
+	directoryCache.entries = map[string]directoryEntry{}
+	directoryCache.Unlock()
+	resetCalls()
 	mu.Lock()
 	defer mu.Unlock()
+	saved()
 	cache, loaded = nil, false
+	cacheGeneration++
 }
 
 // List reads the latest sessions of every agent, the most recently active
 // first, at most limit of them (Limit when 0).
 func List(limit int) []Session {
+	dbReadMu.Lock()
+	defer dbReadMu.Unlock()
 	if limit <= 0 {
 		limit = Limit
 	}
@@ -524,11 +768,10 @@ func List(limit int) []Session {
 	if len(keys) > limit {
 		keys = keys[:limit]
 	}
-	var want []file
-	for _, k := range keys {
-		want = append(want, groups[k]...)
-	}
-	refresh(want, files)
+	// every changed file, not just the latest sessions': the first read
+	// indexes them all in one run the page can show, and the stats read
+	// after it has nothing left to do
+	refresh(files, files)
 
 	price := pricer()
 	out := []Session{}
@@ -572,7 +815,7 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 			if first == "" {
 				first = st.First
 			}
-			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "dsh" || s.Agent == "grok") && st.ID != "" && f.path == fs[0].path {
+			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "omp" || s.Agent == "dsh" || s.Agent == "grok") && st.ID != "" && f.path == fs[0].path {
 				s.ID = st.ID
 			}
 		}
@@ -636,23 +879,36 @@ func parse(f file, old *state) *state {
 	case "grok":
 		return parseGrok(f)
 	}
+	headBytes := headOf(f.path)
 	var s *state
-	if old != nil && f.size >= old.Size && old.Off <= f.size {
+	if old != nil && f.size >= old.Size && old.Off <= f.size && sameHead(headBytes, old.Head, old.HeadSize) && old.ContentHash != "" && prefixHash(f.path, old.Size) == old.ContentHash {
 		s = old.clone()
 	} else {
 		s = &state{}
 	}
 	s.Size, s.Mod = f.size, f.mod.UnixNano()
+	s.Head, s.HeadSize = hashHead(headBytes), len(headBytes)
+	s.ContentHash = prefixHash(f.path, f.size)
 	line := claudeLine
 	switch f.agent {
 	case "codex":
 		line = codexLine
-	case "pi":
+	case "pi", "omp":
 		line = piParse
 	case "workbuddy":
 		line = workbuddyLine
 	}
-	off, err := scan(f.path, s.Off, func(b []byte) { line(s, b, f.main) })
+	var head func([]byte) bool
+	if f.agent == "codex" {
+		line = codexBody
+	}
+	if f.agent == "codex" {
+		head = func(b []byte) bool { return codexHead(s, b, f.main) }
+	}
+	off, err := scanAt(f.path, s.Off, head, func(b []byte, _, _ int64) bool {
+		line(s, b, f.main)
+		return true
+	})
 	if err == nil {
 		s.Off = off
 	}
@@ -669,6 +925,22 @@ const maxLine = 32 << 20
 // scan calls fn on each whole line of the file from off, and returns the
 // offset after the last one. A line still being written is left for later.
 func scan(path string, off int64, fn func([]byte)) (int64, error) {
+	return scanHead(path, off, nil, fn)
+}
+
+// scanHead is scan with a look at each line's start first: head is given
+// the line, or its first megabyte when it is longer, and a line it says no
+// to is stepped over without being gathered (most of a Codex rollout's
+// bytes are lines no one reads: compactions, tool output). A nil head
+// wants every line.
+func scanHead(path string, off int64, head func([]byte) bool, fn func([]byte)) (int64, error) {
+	return scanAt(path, off, head, func(b []byte, _, _ int64) bool { fn(b); return true })
+}
+
+// scanAt is scanHead telling fn where each line starts and ends in the file,
+// and stopping when fn says so; what it returns is where the last line it
+// handled ended.
+func scanAt(path string, off int64, head func([]byte) bool, fn func(b []byte, start, end int64) bool) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return off, err
@@ -680,11 +952,15 @@ func scan(path string, off int64, fn func([]byte)) (int64, error) {
 	r := bufio.NewReaderSize(f, 1<<20)
 	var long []byte
 	var n int64 // bytes of the line so far
-	skip := false
+	skip, seen := false, false
 	for {
 		chunk, err := r.ReadSlice('\n')
 		n += int64(len(chunk))
 		if errors.Is(err, bufio.ErrBufferFull) {
+			if !seen && head != nil {
+				seen = true
+				skip = skip || !head(chunk)
+			}
 			if !skip && len(long)+len(chunk) <= maxLine {
 				long = append(long, chunk...)
 			} else {
@@ -704,12 +980,14 @@ func scan(path string, off int64, fn func([]byte)) (int64, error) {
 			b = long
 		}
 		if !skip {
-			if b = bytes.TrimSpace(b); len(b) > 0 {
-				fn(b)
+			if b = bytes.TrimSpace(b); len(b) > 0 && (seen || head == nil || head(b)) {
+				if !fn(b, off, off+n) {
+					return off + n, nil
+				}
 			}
 		}
 		off += n
-		n, skip, long = 0, false, long[:0]
+		n, skip, seen, long = 0, false, false, long[:0]
 	}
 }
 
@@ -755,27 +1033,28 @@ func title(s string) string {
 var dated = regexp.MustCompile(`-\d{8}$`)
 
 // priceOf prices a model as a session names it: one through magpie as
-// "<provider>/<model>" at the price the gateway counts it at, else the bare
-// id at its maker's list price on models.dev.
-func priceOf(model string) (catalog.Price, bool) {
+// "<provider>/<model>" at the price the gateway counts it at — what the user
+// set for that provider and model, else that provider's own list price, else
+// its maker's on models.dev — and a bare id only ever at its maker's, which is
+// a different question from what one provider charges.
+//
+// The settings are the ones passed in rather than read here: a listing reads
+// them once and prices every model of it against that same copy, so a
+// listing is one snapshot of the prices and reads the file once, not once
+// per model.
+func priceOf(s settings.Settings, model string) (catalog.Price, bool) {
 	m := strings.TrimSpace(model)
 	if m == "" {
 		return catalog.Price{}, false
 	}
 	if pid, rest, ok := strings.Cut(m, "/"); ok {
-		for _, p := range provider.All() {
-			if p.ID == pid {
-				for _, c := range p.Catalogs() {
-					if pr, ok := catalog.PriceOf(c, rest); ok {
-						return pr, true
-					}
-				}
-				break
-			}
+		if pr, ok := provider.EffectivePriceIn(s, pid, rest); ok {
+			return pr, true
 		}
 	}
 	bare := strings.ToLower(m[strings.LastIndexByte(m, '/')+1:])
-	for _, id := range []string{bare, dated.ReplaceAllString(bare, "")} {
+	// a Grok id at an effort (grok-4.7-high) at its model's price
+	for _, id := range []string{bare, dated.ReplaceAllString(bare, ""), provider.PricedName(bare)} {
 		for _, c := range makers(id) {
 			if pr, ok := catalog.PriceOf(c, id); ok {
 				return pr, true
@@ -828,6 +1107,8 @@ func ResumeCommand(agent, id, cwd string) string {
 		run = "qoderclicn --resume " + id
 	case "grok":
 		run = "grok --resume " + id
+	case "omp":
+		run = "omp --resume " + id
 	default:
 		return ""
 	}
@@ -842,12 +1123,37 @@ func ResumeCommand(agent, id, cwd string) string {
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// Find is a listed session by agent and id.
+// Find is a session by agent and id: a listed one, else one Get finds
+// under agent:id.
 func Find(agent, id string) (Session, bool) {
 	for _, s := range List(0) {
 		if s.Agent == agent && s.ID == id {
 			return s, true
 		}
 	}
+	if s, ok := Get(agent + ":" + id); ok && s.ID == id {
+		return s, true
+	}
 	return Session{}, false
+}
+
+// Get is the session whose files are grouped under key (a Summary's Key),
+// however long ago it was at work.
+func Get(key string) (Session, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	loadCache()
+	defer closeDBs()
+	files := allFiles()
+	var fs []file
+	for _, f := range files {
+		if f.key == key {
+			fs = append(fs, f)
+		}
+	}
+	if len(fs) == 0 {
+		return Session{}, false
+	}
+	refresh(fs, files)
+	return assemble(fs, pricer())
 }

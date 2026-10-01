@@ -103,6 +103,9 @@ func TestCodexOwnModelTraced(t *testing.T) {
 	if st.Totals.Requests != 1 {
 		t.Errorf("totals %+v", st.Totals)
 	}
+	if recs := usage.Load(time.Time{}); len(recs) != 1 || recs[0].RouteID != r.ID || r.ID == 0 {
+		t.Fatalf("usage: %+v, route %d", recs, r.ID)
+	}
 }
 
 func TestCodexOwnModelOmitsNonemptyReasoning(t *testing.T) {
@@ -395,6 +398,60 @@ func TestCodexModelListNarrowedByPicks(t *testing.T) {
 	}
 }
 
+// A native model taken out of Codex's list on the Agents page is dropped
+// from the backend's list too, and the ETag changes so Codex asks again.
+func TestCodexModelListHidesOnAgentsPage(t *testing.T) {
+	codexSignedIn(t)
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-5.5", "gpt-5-codex"}}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		io.WriteString(w, `{"models":[{"slug":"gpt-5.5","priority":1},{"slug":"gpt-5-codex","priority":2}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	list := func() ([]string, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		New().Handler().ServeHTTP(rec, req)
+		var got struct {
+			Models []map[string]any `json:"models"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &got)
+		var native []string
+		for _, m := range got.Models {
+			if slug, _ := m["slug"].(string); strings.HasPrefix(slug, "gpt-") {
+				native = append(native, slug)
+			}
+		}
+		return native, rec.Header().Get("ETag")
+	}
+	all, before := list()
+	if len(all) != 2 {
+		t.Fatalf("native models %v", all)
+	}
+	var id string
+	for _, e := range provider.Catalog() {
+		if acc := e.Provider.Account; acc != nil && acc.Agent == "codex" && e.Model == "gpt-5-codex" {
+			id = e.ID
+		}
+	}
+	if id == "" {
+		t.Fatal("no catalog entry for the account's gpt-5-codex")
+	}
+	if err := provider.SetHiddenModels("codex", []string{id}); err != nil {
+		t.Fatal(err)
+	}
+	native, after := list()
+	if len(native) != 1 || native[0] != "gpt-5.5" || after == before {
+		t.Errorf("native %v, ETag %q then %q", native, before, after)
+	}
+}
+
 // A reply's X-Models-Etag carries magpie's list too: Codex refetches its
 // model list on a new one, and only on the backend's it never would when a
 // provider was added.
@@ -585,5 +642,68 @@ func TestCodexThirdPartyCompactEndpointRejected(t *testing.T) {
 	code, body := post(t, CodexPath+"/responses/compact", `{"model":"fake/m1","input":[]}`)
 	if code != 400 || !strings.Contains(body, "not supported") || f.calls != 0 {
 		t.Fatalf("%d %s, calls %d", code, body, f.calls)
+	}
+}
+
+func TestCodexBackendKeepsNativeSession(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"usage":{"input_tokens":9,"output_tokens":2}}}`))
+	})
+	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":[]}`))
+	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("Session_id", "native-thread")
+	req.Header.Set(SessionHeader, "routing-override")
+	rec := httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, req)
+	rs := usage.Load(time.Time{})
+	if len(rs) != 1 || rs[0].NativeSession != "native-thread" || rs[0].Session != "routing-override" {
+		t.Fatalf("lost native session: %+v", rs)
+	}
+}
+
+// A codex provider switched off narrows nothing: it serves no agent
+// anything, so the account's own list is left whole, its picks kept for
+// when it is switched on again.
+func TestCodexModelListNotNarrowedWhileOff(t *testing.T) {
+	codexSignedIn(t)
+	if err := provider.Save(provider.Provider{ID: "codex", Models: []string{"gpt-6-sol"}, Off: true}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"models":[{"slug":"gpt-6-sol","priority":1},{"slug":"gpt-5.5","priority":2}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+
+	native := func() []string {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		New().Handler().ServeHTTP(rec, req)
+		var list struct {
+			Models []map[string]any `json:"models"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &list)
+		var out []string
+		for _, m := range list.Models {
+			slug, _ := m["slug"].(string)
+			if strings.HasPrefix(slug, "gpt-") {
+				out = append(out, slug)
+			}
+		}
+		return out
+	}
+	if got := native(); len(got) != 2 {
+		t.Errorf("switched off, the account's own models = %v (want both kept whole)", got)
+	}
+	if err := provider.SetOff("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := native(); len(got) != 1 || got[0] != "gpt-6-sol" {
+		t.Errorf("switched on, the picks narrow again = %v (want just gpt-6-sol)", got)
 	}
 }

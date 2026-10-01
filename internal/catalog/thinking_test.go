@@ -5,7 +5,7 @@ import "testing"
 func TestThinkingOf(t *testing.T) {
 	writeCatalog(t, `{
 		"anthropic":{"models":{"claude-haiku-4-5":{"reasoning_options":[{"type":"budget_tokens"}]}}},
-		"maker":{"models":{"switch":{"reasoning_options":[{"type":"toggle"}]},"plain":{},"levels":{"reasoning_options":[{"type":"effort","values":["low","high"]}]}}},
+		"maker":{"models":{"switch":{"reasoning_options":[{"type":"toggle"}]},"plain":{},"reasoning":{"reasoning":true},"levels":{"reasoning_options":[{"type":"effort","values":["low","high"]}]}}},
 		"relay":{"models":{"plain":{"reasoning_options":[{"type":"effort","values":["high"]}]}}}
 	}`)
 	for _, c := range []struct {
@@ -16,6 +16,7 @@ func TestThinkingOf(t *testing.T) {
 		{"switch:free", "toggle", true},
 		{"levels(high)", "effort", true},
 		{"plain", "", true},
+		{"reasoning", "reasoning", true},
 		{"unknown", "", false},
 	} {
 		got, known := ThinkingOf([]string{"anthropic", "maker", "relay"}, c.id)

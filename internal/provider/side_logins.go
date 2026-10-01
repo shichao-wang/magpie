@@ -8,6 +8,8 @@ package provider
 // behind another or be turned off like the rest.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -33,13 +35,28 @@ func sideLogins(agent, ownUser string, usable func(savedLogin) bool) []sideLogin
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
 	ls := readLogins()
-	if ownUser != "" {
+	// moved onto its plugin, the agent's own sign-in is the plugin's: its
+	// row, set aside, is kept for going back
+	if ownUser != "" && !movedAgent(agent) {
 		found := false
 		for i := range ls {
 			if ls[i].Agent == agent && ls[i].own() {
 				found = true
+				changed := false
 				if !strings.EqualFold(ls[i].User, ownUser) {
 					ls[i].User, ls[i].Seen = ownUser, time.Now().UTC().Truncate(time.Second)
+					changed = true
+				}
+				// removed in magpie, it shows again once the agent signs in
+				// anew: told by its sign-in's mark where the agent has one,
+				// else by another account
+				if ls[i].Hidden != "" {
+					if m := ownMark(agent); m != "" && m != ls[i].Hidden || m == "" && ls[i].Hidden == hiddenNoMark && changed {
+						ls[i].Hidden = ""
+						changed = true
+					}
+				}
+				if changed {
 					_ = writeLogins(ls)
 				}
 			}
@@ -57,13 +74,23 @@ func sideLogins(agent, ownUser string, usable func(savedLogin) bool) []sideLogin
 		if l.Agent != agent {
 			continue
 		}
-		if l.own() && ownUser == "" || !l.own() && !usable(l) {
-			continue // signed out there
+		if l.own() && (ownUser == "" || l.Hidden != "") || !l.own() && !usable(l) {
+			continue // signed out there, or removed in magpie
+		}
+		// the agent's own that is one of magpie's already, as when the
+		// agent was signed in to another account (or signed out) when
+		// magpie signed this one in, and the agent signed in to it after:
+		// that one stands for it, as above, not listed twice (蓝猫 on
+		// Discord, Devin)
+		if l.own() && slices.ContainsFunc(ls, func(m savedLogin) bool {
+			return m.Agent == agent && !m.own() && strings.EqualFold(m.User, l.User) && usable(m)
+		}) {
+			continue
 		}
 		if l.First || (first < 0 && l.own()) {
 			first = len(out)
 		}
-		out = append(out, sideLogin{Login{Agent: agent, User: l.User, Plan: l.Plan, Seen: l.Seen, On: l.On}, l})
+		out = append(out, sideLogin{Login{Agent: agent, User: l.User, Plan: l.Plan, Seen: l.Seen, On: l.On, Own: l.own()}, l})
 	}
 	if len(out) == 0 {
 		return nil
@@ -137,23 +164,70 @@ func setSideLoginOn(agent, user string, on bool, ls []sideLogin) error {
 }
 
 // forgetSideLogin drops an account magpie signed in; gone is told what it
-// kept. The agent's own is signed out in the agent (ownHow says how).
-func forgetSideLogin(agent, user, ownHow string, ls []sideLogin, gone func(savedLogin)) error {
-	if strings.EqualFold(activeOf(ls), user) {
+// kept. The agent's own sign-in is only hidden: its files stay as they
+// are, and it shows again once the agent signs in anew (ownMark). Hidden
+// while first, the next account is put first.
+func forgetSideLogin(agent, user string, ls []sideLogin, gone func(savedLogin)) error {
+	own := slices.ContainsFunc(ls, func(l sideLogin) bool { return l.Own && strings.EqualFold(l.User, user) })
+	first := strings.EqualFold(activeOf(ls), user)
+	if first && !own {
 		return fmt.Errorf("magpie uses %s first; put another account first", user)
+	}
+	next := ""
+	if first {
+		for _, l := range ls {
+			if !strings.EqualFold(l.User, user) {
+				next = l.User
+				break
+			}
+		}
+	}
+	mark := hiddenNoMark
+	if own {
+		mark = firstNonEmpty(ownMark(agent), hiddenNoMark)
 	}
 	var old savedLogin
 	err := editSideLogin(agent, user, func(saved []savedLogin, i int) ([]savedLogin, error) {
 		if saved[i].own() {
-			return nil, fmt.Errorf("that is %s", ownHow)
+			saved[i].Hidden, saved[i].First = mark, false
+			for j := range saved {
+				if next != "" && saved[j].Agent == agent {
+					saved[j].First = strings.EqualFold(saved[j].User, next)
+				}
+			}
+			return saved, nil
 		}
 		old = saved[i]
 		return append(saved[:i], saved[i+1:]...), nil
 	})
-	if err == nil && gone != nil {
+	if err == nil && gone != nil && old.Agent != "" {
 		gone(old)
 	}
 	return err
+}
+
+// hiddenNoMark hides an agent's own sign-in that has no mark to tell a
+// fresh sign-in by: it shows again when another account signs in.
+const hiddenNoMark = "hidden"
+
+// ownMark tells one sign-in of the agent's own from the next, "" where
+// the agent has no way to: a new sign-in, even to the same account, gets a
+// new refresh token and so a new mark. Only a digest is kept, never the
+// secret.
+func ownMark(agent string) string {
+	var secret string
+	switch agent {
+	case "kiro":
+		c, ok := readKiroAt("", "")
+		if !ok {
+			return ""
+		}
+		secret = c.dbKey + c.idePath + "\x00" + firstNonEmpty(c.refresh, c.access)
+	default:
+		return ""
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:12])
 }
 
 // addSideLogin keeps an account magpie just signed in, in use beside the
@@ -173,7 +247,14 @@ func addSideLogin(l savedLogin, ownUser string, dup func(savedLogin)) error {
 		if ls[i].Agent == l.Agent && strings.EqualFold(ls[i].User, l.User) {
 			if ls[i].own() && strings.EqualFold(ownUser, l.User) {
 				dup(l)
-				return nil
+				// removed in magpie, the agent's own is brought back by
+				// signing in to it again: kept hidden, the sign-in said
+				// done and the account was listed nowhere (#320)
+				if ls[i].Hidden == "" {
+					return nil
+				}
+				ls[i].Hidden = ""
+				return writeLogins(ls)
 			}
 			old := ls[i]
 			ls[i].Auth, ls[i].Home, ls[i].Plan, ls[i].Seen = l.Auth, l.Home, l.Plan, l.Seen
@@ -193,7 +274,7 @@ func addSideLogin(l savedLogin, ownUser string, dup func(savedLogin)) error {
 // agent's own store as Claude Code's and Codex's are.
 func sideAgent(agent string) bool {
 	switch agent {
-	case "grok", "copilot", "zcode", "kiro", "devin", "workbuddy", WorkBuddyAIID, CommandCodePlanID, "gemini", "antigravity", "qoder":
+	case "grok", "copilot", "zcode", "kiro", "devin", "workbuddy", WorkBuddyAIID, CommandCodePlanID, "gemini", "antigravity", "qoder", QoderCNID, "zed", "factory", MiMoID:
 		return true
 	}
 	return false

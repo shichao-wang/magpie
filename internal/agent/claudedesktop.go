@@ -81,6 +81,14 @@ func desktopDirs(goos, home string, getenv func(string) string) (string, string)
 	return filepath.Join(d, "Claude"), filepath.Join(d, "Claude-3p")
 }
 
+// DesktopConfig3p is the claude_desktop_config.json Claude Desktop reads in
+// its 3p mode: there its whole userData is Claude-3p, its MCP servers too
+// (%LOCALAPPDATA%\Claude-3p on Windows, Claude-3p beside Claude elsewhere).
+func DesktopConfig3p(home string) string {
+	_, d := desktopDirs(runtime.GOOS, home, os.Getenv)
+	return filepath.Join(d, "claude_desktop_config.json")
+}
+
 // windowsDesktopDir is %LOCALAPPDATA%\Claude (or Claude-3p), else the first
 // folder there named Claude… (with -3p in it or not), as CC Switch finds it.
 func windowsDesktopDir(local string, threep bool) string {
@@ -115,6 +123,8 @@ func claudeDesktop(home string) *Agent {
 			also = filepath.Join(d, "Claude")
 		}
 	}
+	// Only provider changes need Desktop to read its configuration again.
+	stale := false
 	a := &Agent{
 		ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Aliases: []string{"claude-app"},
 		Dir: p.dir, Path: p.config,
@@ -123,15 +133,18 @@ func claudeDesktop(home string) *Agent {
 				if d == "" {
 					continue
 				}
-				if _, err := os.Stat(d); err == nil {
+				if isDir(d) {
 					return true
 				}
 			}
 			return false
 		},
 		Notice: func() string {
+			if !stale {
+				return ""
+			}
 			if desktopWired(p) {
-				return "Claude Desktop reads its gateway at start-up — quit and reopen it if you changed the provider (Code and Cowork, no Anthropic sign-in); tier changes take effect immediately."
+				return "Claude Desktop reads this at start-up — quit and reopen it to run on magpie (Code and Cowork, no Anthropic sign-in)."
 			}
 			return "Claude Desktop reads this at start-up — quit and reopen it to sign in with Anthropic again."
 		},
@@ -157,6 +170,7 @@ func claudeDesktop(home string) *Agent {
 				return ""
 			},
 			Set: func(v string) error {
+				stale = true
 				if v == "" {
 					return desktopOff(p)
 				}
@@ -179,6 +193,7 @@ func claudeDesktop(home string) *Agent {
 				return v
 			},
 			Set: func(v string) error {
+				stale = false
 				if !desktopWired(p) {
 					if v == "" {
 						return nil

@@ -146,10 +146,21 @@
 .masking .pii { animation: rtpii .35s ease-out both; }
 @keyframes rtpii { from { filter: blur(0); opacity: 1; } }
 #view-routing .rt { margin: 0; }
-.rt-more { container-type: inline-size; padding-bottom: 12px; }
+.rt-more { container: rt-more / inline-size; padding-bottom: 12px; }
 .rt-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: 16px; }
-@container (min-width: 860px) { .rt-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; } }
-.rt-col { min-width: 0; }
+/* side by side, the accounts end where the requests do and scroll like
+   them, not run on down the page beside an empty column: of no height of
+   their own, they take what the requests give the row, and no less than a
+   few accounts' */
+@container rt-more (min-width: 860px) {
+  .rt-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rt-cols:not(.solo) .rt-col:last-child { display: flex; flex-direction: column; }
+  .rt-cols:not(.solo) .rt-acts { flex: 1 1 auto; height: 0; min-height: 216px; overflow-y: auto; overscroll-behavior: contain; }
+}
+/* each column its own container: a request's row lays itself out by the
+   list's width, not the page's (#273: in two columns of ~470px the rows
+   kept to one line, and the reasoning was drawn over the numbers) */
+.rt-col { min-width: 0; container-type: inline-size; }
 .rt-reqs { padding: 4px; max-height: 420px; overflow-y: auto; display: grid; grid-template-columns: auto fit-content(36%) minmax(0, 1fr) auto; }
 .rt-req { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center; column-gap: 12px; padding: 6px 8px; font: inherit; font-size: 12px; text-align: left; color: var(--fg-2); background: none; border: 1px solid transparent; border-radius: 8px; cursor: pointer; }
 .rt-req:hover { background: var(--card-2); }
@@ -168,6 +179,7 @@
 .rt-req .to .ef { flex: none; overflow: visible; margin-left: -2px; color: var(--muted); }
 .rt-req .ef::before { content: "· "; }
 .rt-req .to .ef.picked { color: var(--fg-2); }
+.rt-req .ef .was { opacity: .75; }
 /* what a call was for (a Codex guardian review, a title…): a quiet grey tag by the model */
 .rt-req .asked .kind, .rp-req .kind, .rt-steps li .kind { flex: none; font-size: 10.5px; line-height: 16px; padding: 0 5px; border-radius: 5px; color: var(--muted); background: var(--card-2); border: 1px solid var(--line); white-space: nowrap; }
 .rt-steps li .kind { display: inline-block; vertical-align: 1px; }
@@ -176,9 +188,24 @@
 .rt-req .asked.kinded .m { flex: none; max-width: calc(100% - 3.2em - 40px); }
 .rt-req .to .swap, .rt-steps li .swap { font-size: 10.5px; line-height: 16px; padding: 0 5px; border-radius: 5px; color: var(--amber); background: var(--amber-soft); white-space: nowrap; }
 .rt-req .to .swap { flex: none; max-width: 70%; }
+.rt-req .to .routed, .pr-to .routed { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; font-size: 10.5px; line-height: 16px; color: var(--muted); white-space: nowrap; }
 .rt-steps li.swap::before { background: var(--amber); }
 .rt-req .meta { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
-@container (max-width: 520px) { .rt-reqs { grid-template-columns: auto minmax(0, 1fr); } .rt-req { row-gap: 2px; } .rt-req .to { grid-column: 2; } .rt-req .meta { grid-column: 2; text-align: left; } }
+/* one line wants room for the time, the model, where it went at what
+   reasoning, and the numbers; in less, where it went and the numbers share
+   a line under the model, and in less still each has a line of its own */
+@container (max-width: 640px) {
+  .rt-reqs { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .rt-req { row-gap: 2px; }
+  .rt-req .asked { grid-column: 2 / -1; }
+  .rt-req .to { grid-column: 2; }
+  .rt-req .meta { grid-column: 3; }
+}
+@container (max-width: 460px) {
+  .rt-reqs { grid-template-columns: auto minmax(0, 1fr); }
+  .rt-req .asked, .rt-req .to, .rt-req .meta { grid-column: 2; }
+  .rt-req .meta { text-align: left; white-space: normal; }
+}
 .rt-acts { padding: 4px 0; }
 .rt-cols.solo { grid-template-columns: minmax(0, 1fr); }
 .rt-reqs.none { display: block; background: none; border-color: transparent; }
@@ -198,6 +225,7 @@
 .rt-act .st.left { color: var(--muted); }
 .rt-act .tally { display: flex; flex-wrap: wrap; gap: 2px 12px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .rt-act .tally .bad { color: var(--red); }
+.rt-act .mdls { display: flex; flex-wrap: wrap; gap: 4px; }
 .rt-act .fix { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 11px; }
 .rt-act .bar { height: 3px; border-radius: 2px; background: var(--card-2); overflow: hidden; }
 .rt-act .bar i { display: block; height: 100%; border-radius: 2px; background: var(--muted); }
@@ -224,6 +252,19 @@
 .rt-group .tags { display: flex; gap: 4px; flex: none; }
 .rt-group .tag { font-size: 11px; line-height: 18px; padding: 0 8px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line); color: var(--muted); white-space: nowrap; }
 .rt-group .tag.bad { color: var(--red); }
+.rt-group .tag.idle { opacity: .55; }
+/* a manual group's members on its card: the one picked, marked by a dot */
+.rt-picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.rt-pick { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; min-width: 0; height: 22px; padding: 0 8px 0 6px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted); font: inherit; font-size: 11.5px; cursor: pointer; transition: background .12s, color .12s, border-color .12s; }
+.rt-pick:hover { color: var(--fg); border-color: var(--muted); background: var(--card); }
+.rt-pick .dot { width: 7px; height: 7px; flex: none; border-radius: 50%; box-shadow: inset 0 0 0 1.5px var(--faint); }
+.rt-pick .ic, .rt-pick .ic-stack { width: 13px; height: 13px; flex: none; }
+.rt-pick .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rt-pick small { color: var(--faint); font-size: 10.5px; white-space: nowrap; }
+.rt-pick.on { color: var(--fg); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); cursor: default; }
+.rt-pick.on .dot { background: var(--accent); box-shadow: none; }
+.rt-pick.off { opacity: .55; }
+.rt-pick:focus-visible { outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
 .rt-gnone { padding: 14px; font-size: 12px; line-height: 1.5; }
 .rt-ghidden { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 6px 12px 6px 14px; font-size: 11.5px; color: var(--faint); }
 .rt-ghidden > span { margin-right: 4px; }
@@ -285,12 +326,21 @@
 .rt-cond.tk { cursor: text; }
 .rt-cond.in { cursor: text; }
 .rt-cond.in input, .editor .rt-cond.in input[type="text"] { width: 24ch; }
+/* a rule's hours: two times in the pill, typed; one that isn't a time is marked */
+.rt-cond.tm { cursor: text; }
+.rt-cond.tm input.clock, .editor .rt-cond.tm input.clock[type="text"] { width: 5.5ch; text-align: center; }
+.rt-cond.tm.bad { border-style: solid; border-color: var(--amber, var(--muted)); }
+.rt-cond[hidden] { display: none; }
 .rt-classifier { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
 .rt-classifier[hidden] { display: none; }
 .rt-classifier .w { color: var(--muted); font-size: 12px; }
 .rt-classifier .hint { flex-basis: 100%; }
+/* the levels a group names for agents (#295): one toggle each */
+.rt-levels { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 6px; }
+.rt-levels[hidden] { display: none; }
 /* the field is the pill: the editor's boxed input (its border and focus ring) stays off it */
-.rt-cond input, .editor .rt-cond input[type="text"], .editor .rt-cond input:focus, .editor .rt-cond input:focus-visible { box-shadow: none; border-radius: 0; }
+.rt-cond input, .editor .rt-cond input[type="text"], .editor .rt-cond input:focus { box-shadow: none; border-radius: 0; }
+.editor .rt-cond input:focus-visible { box-shadow: none; border-radius: 0; }
 .rt-cond:focus-within { border-style: solid; border-color: var(--accent); color: var(--fg); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .rt-cond input, .editor .rt-cond input[type="text"] { width: 7ch; height: 20px; padding: 0 2px; border: 0; background: transparent; color: inherit; font: inherit; font-variant-numeric: tabular-nums; outline: none; -moz-appearance: textfield; }
 .rt-cond input::-webkit-outer-spin-button, .rt-cond input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
@@ -388,3 +438,30 @@
 .pr-to .swap { flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; font-size: 10.5px; line-height: 16px; padding: 0 5px; border-radius: 5px; color: var(--amber); background: var(--amber-soft); white-space: nowrap; }
 .pr-req .meta { justify-self: end; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
 @media (prefers-reduced-motion: reduce) { .pr-req.wait .pr-to > i, .ps-dst.wait > i, .ps-hub.busy, .ps-dot.wait { animation: none; } }
+/* Safari before 16 (macOS 12's, #220) has neither container queries nor
+   subgrid: there the narrow layouts above go by the window's width (the
+   tray panel is narrower than any of them), and a request's row sets out
+   its own columns */
+@supports not (container-type: inline-size) {
+  @media (max-width: 560px) {
+    .rt-stage { grid-template-columns: 1fr 1fr; column-gap: 28px; row-gap: 26px; padding: 16px 0; }
+    .rt-accts { grid-column: 1 / -1; padding-left: 22px; }
+    .rt-accts li { grid-template-columns: 10px minmax(0, 1fr); }
+    .rt-accts em { grid-column: 2; white-space: normal; }
+    .rt-accts .bar { grid-column: 2; }
+    .rt-stats { gap: 14px; }
+    .rt-gsec .row-head .note { display: none; }
+    .rt-gedit { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+    .rt-gedit label { text-align: left; padding-top: 8px; }
+    .rt-gedit .segs .opt { padding-left: 9px; padding-right: 9px; }
+  }
+}
+@supports not (grid-template-columns: subgrid) {
+  .rt-req { grid-template-columns: auto fit-content(36%) minmax(0, 1fr) auto; }
+  @media (max-width: 700px) {
+    .rt-reqs { grid-template-columns: auto minmax(0, 1fr); }
+    .rt-req { grid-template-columns: auto minmax(0, 1fr); row-gap: 2px; }
+    .rt-req .to { grid-column: 2; }
+    .rt-req .meta { grid-column: 2; text-align: left; white-space: normal; }
+  }
+}

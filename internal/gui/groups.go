@@ -29,6 +29,12 @@ type groupJSON struct {
 	// Holds: the groups in it, at any depth — none of which can have it in
 	// turn
 	Holds []string `json:"holds"`
+	// Offers: the reasoning levels agents are offered for it; Shared: those
+	// its members have in common, which it offers unless it names its own
+	Offers []string `json:"offers"`
+	Shared []string `json:"shared"`
+	// Picked: the member a manual group sends every request to
+	Picked string `json:"picked,omitempty"`
 }
 
 type memberJSON struct {
@@ -44,6 +50,10 @@ type memberJSON struct {
 	// Effort that effort ("provider/model:low"); "" for one without
 	Of     string `json:"of,omitempty"`
 	Effort string `json:"effort,omitempty"`
+	// Fast: the group sends it in its vendor's fast mode; CanFast: its
+	// model has one (provider.CanFast)
+	Fast    bool `json:"fast,omitempty"`
+	CanFast bool `json:"canFast,omitempty"`
 	// what a rule may send it: the tokens it takes, when known, and images
 	Context int  `json:"context,omitempty"`
 	Images  bool `json:"images,omitempty"`
@@ -59,6 +69,9 @@ type modelRef struct {
 	// Efforts: the model's reasoning levels, when known — those a group's
 	// member of it may be fixed at
 	Efforts []string `json:"efforts,omitempty"`
+	// CanFast: a group's member of it may be sent in its vendor's fast
+	// mode (provider.CanFast)
+	CanFast bool `json:"canFast,omitempty"`
 }
 
 type poolJSON struct {
@@ -126,11 +139,17 @@ func groupsState() groupsJSON {
 	served := provider.Served()
 	for _, e := range served {
 		if e.Group == "" {
-			out.Models = append(out.Models, modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Context: e.Context, Efforts: e.Efforts})
+			out.Models = append(out.Models, modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Context: e.Context, Efforts: e.Efforts, CanFast: provider.CanFast(e.Provider, e.Model)})
 		}
 	}
 	for _, g := range provider.Groups() {
-		gj := groupJSON{Group: g, Info: []memberJSON{}, Holds: []string{}}
+		gj := groupJSON{Group: g, Info: []memberJSON{}, Holds: []string{}, Offers: []string{}, Shared: []string{}}
+		for _, e := range served {
+			if e.ID == provider.GroupPrefix+g.ID {
+				gj.Offers, gj.Shared = append(gj.Offers, e.Efforts...), append(gj.Shared, e.Shared...)
+				break
+			}
+		}
 		if _, ms, ok := provider.FindGroup(provider.GroupPrefix + g.ID); ok {
 			for _, m := range ms {
 				for _, v := range m.Groups() {
@@ -165,6 +184,8 @@ func groupsState() groupsJSON {
 			if p, model, ok := provider.Resolve(of); ok {
 				_, who := onOf(p)
 				m.Ready, m.Provider, m.Name, m.Icon, m.Model, m.On = true, p.ID, p.Name, p.Icon, model, max(len(who), 1)
+				m.CanFast = provider.CanFast(p, model)
+				m.Fast = m.CanFast && g.IsFast(id)
 				for _, e := range served {
 					if e.Group == "" && e.Provider.ID == p.ID && e.Model == model {
 						m.Context, m.Images = e.Context, e.Images && (e.ImageInput == nil || *e.ImageInput)
@@ -174,6 +195,12 @@ func groupsState() groupsJSON {
 				gj.Ready = true
 			}
 			gj.Info = append(gj.Info, m)
+		}
+		if g.Routing == provider.Manual {
+			// agents can pick it while the member picked can answer
+			gj.Picked = g.Picked()
+			i := slices.IndexFunc(gj.Info, func(m memberJSON) bool { return m.ID == gj.Picked })
+			gj.Ready = i >= 0 && gj.Info[i].Ready
 		}
 		out.Groups = append(out.Groups, gj)
 	}

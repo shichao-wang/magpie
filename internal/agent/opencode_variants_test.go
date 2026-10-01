@@ -152,7 +152,7 @@ func TestOpenCodeNoResellerLevelsForSwitchModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Chat: "https://relay.test/v1", Key: "k",
-		Models: []string{"mimo-v2.6-flash", "open-model"}}); err != nil {
+		Models: []string{"mimo-v2.6-flash", "open-model", "mystery-model"}}); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(home, ".config", "opencode", "opencode.json")
@@ -199,13 +199,21 @@ func TestOpenCodeNoResellerLevelsForSwitchModel(t *testing.T) {
 				t.Errorf("pi %s: reasoning %v, levels %v", m.ID, m.Reasoning, m.Levels)
 			}
 		case "relay/open-model":
+			// the full map, levels the model lacks null so Pi hides them (#243)
 			seen++
-			if !m.Reasoning || m.Levels["max"] != "max" {
+			want := map[string]any{"off": nil, "minimal": nil, "low": "low", "medium": nil, "high": "high", "xhigh": nil, "max": "max"}
+			if !m.Reasoning || !reflect.DeepEqual(m.Levels, want) {
+				t.Errorf("pi %s: reasoning %v, levels %v", m.ID, m.Reasoning, m.Levels)
+			}
+		case "relay/mystery-model":
+			// levels magpie doesn't know: Pi's own, as before
+			seen++
+			if m.Reasoning || m.Levels != nil {
 				t.Errorf("pi %s: reasoning %v, levels %v", m.ID, m.Reasoning, m.Levels)
 			}
 		}
 	}
-	if seen != 3 {
+	if seen != 4 {
 		t.Errorf("pi models: %s", pi)
 	}
 }

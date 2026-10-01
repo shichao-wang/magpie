@@ -11,7 +11,7 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
-func TestClaudeDesktopHaikuCapabilities(t *testing.T) {
+func TestClaudeDesktopTierCapabilities(t *testing.T) {
 	up := setup(t, provider.Anthropic, &fake{})
 	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Anthropic: up.URL, Models: []string{"m1", "claude-haiku-4-5", "effort-model"}}); err != nil {
 		t.Fatal(err)
@@ -23,30 +23,35 @@ func TestClaudeDesktopHaikuCapabilities(t *testing.T) {
 	}
 	before := DesktopTiers
 	t.Cleanup(func() { DesktopTiers = before })
-	for _, c := range []struct {
-		ref, id string
-		picker  bool
-	}{
-		{"fake/claude-haiku-4-5", "claude-haiku-magpie", false},
-		{"fake/effort-model", "mythos-magpie-haiku", true},
-		{"fake/m1", "claude-haiku-magpie", false},
-		{"fake/private-model", "claude-haiku-magpie", false},
-		{"fake/private-effort", "mythos-magpie-haiku", true},
-		{"", "claude-haiku-magpie", false},
-	} {
-		DesktopTiers = func() map[string]string { return map[string]string{"haiku": c.ref} }
-		models := desktopModels()
-		m := models[2]
-		if len(models) != 4 || m["id"] != c.id || m["anthropic_family_tier"] != "haiku" || m["reasoning"] != c.picker {
-			t.Fatalf("%s: %v", c.ref, models)
-		}
-		for _, id := range []string{c.id, c.id + "[1m]", "anthropic/" + c.id} {
-			if DesktopTier(id) != "haiku" || !desktopAccepts(id) || desktopPicker(strings.TrimPrefix(id, "anthropic/")) != c.picker {
-				t.Errorf("%s: wrong client or routing capabilities", id)
+	for _, tier := range []string{"opus", "sonnet", "haiku", "fable"} {
+		for _, c := range []struct {
+			ref, id string
+			picker  bool
+		}{
+			{"fake/claude-haiku-4-5", "claude-haiku-magpie", false},
+			{"fake/effort-model", "mythos-magpie-haiku", true},
+			{"fake/m1", "claude-haiku-magpie", false},
+			{"fake/private-model", "claude-haiku-magpie", false},
+			{"fake/private-effort", "mythos-magpie-haiku", true},
+		} {
+			c.id = strings.ReplaceAll(c.id, "haiku", tier)
+			if tier == "fable" && !c.picker {
+				c.id = "magpie-tier-fable"
 			}
-		}
-		if desktopCatalogKey(c.id) == "claude-haiku-4-5" || !strings.HasSuffix(m["display_name"].(string), " · Haiku") || !desktopSmallFast(c.id) {
-			t.Fatalf("alias lost custom name or small_fast: %v", m)
+			DesktopTiers = func() map[string]string { return map[string]string{tier: c.ref} }
+			models := desktopTierModels()
+			m := models[0]
+			if len(models) != 1 || m["id"] != c.id || m["anthropic_family_tier"] != tier || m["reasoning"] != c.picker {
+				t.Fatalf("%s: %v", c.ref, models)
+			}
+			for _, id := range []string{c.id, c.id + "[1m]", "anthropic/" + c.id} {
+				if DesktopTier(id) != tier || !desktopAccepts(id) || desktopPicker(strings.TrimPrefix(id, "anthropic/")) != c.picker {
+					t.Errorf("%s: wrong client or routing capabilities", id)
+				}
+			}
+			if desktopCatalogKey(c.id) == "claude-haiku-4-5" || !strings.HasSuffix(m["display_name"].(string), " · "+strings.ToUpper(tier[:1])+tier[1:]) || tier != "fable" && !desktopSmallFast(c.id) {
+				t.Fatalf("alias lost custom name or small_fast: %v", m)
+			}
 		}
 	}
 }
@@ -118,7 +123,7 @@ func TestClaudeDesktopHaikuThinkingActualModel(t *testing.T) {
 		{"claude-3-5-haiku-20241022", `{"type":"adaptive"}`, "high", "", "", 0},
 		{"claude-opus-5", `{"type":"enabled","budget_tokens":4096}`, "high", "adaptive", "high", 0},
 		{"claude-opus-5-5", `{"type":"disabled"}`, "high", "", "high", 0},
-		{"claude-sonnet-5-5", `{"type":"disabled"}`, "max", "between_tools", "high", 0},
+		{"claude-sonnet-5-5", `{"type":"disabled"}`, "max", "", "max", 0},
 		{"effort-model", `{"type":"adaptive"}`, "max", "adaptive", "high", 0},
 	} {
 		t.Run(c.model+"/"+c.wantType+"/"+c.effort, func(t *testing.T) {

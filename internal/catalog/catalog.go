@@ -57,6 +57,9 @@ type Model struct {
 	// Free is set on a model a subscription serves at no cost to its
 	// allowance: WorkBuddy's "credits": "x0.00".
 	Free bool `json:",omitempty"`
+	// Reasoning is set on a model that thinks, whether or not it takes
+	// levels: mimo-v2.6-flash thinks with a switch alone (#402).
+	Reasoning bool `json:",omitempty"`
 }
 
 func imageInput(modalities []string) *bool {
@@ -94,6 +97,7 @@ type mdModel struct {
 	Name        string `json:"name"`
 	ReleaseDate string `json:"release_date"`
 	Temperature *bool  `json:"temperature"` // false: rejects temperature/top_p
+	Thinks      bool   `json:"reasoning"`
 	Reasoning   []struct {
 		Type   string   `json:"type"`
 		Values []string `json:"values"`
@@ -135,11 +139,14 @@ func (m mdModel) window() int {
 	return m.Limit.Context
 }
 
-const modelsDevURL = "https://models.dev/api.json"
+var modelsDevURL = "https://models.dev/api.json" // a var for tests
 
 var (
-	once sync.Once
-	mdev map[string]mdProvider
+	// loadMu guards loading and Reset: a background Sync (fresh.go) resets
+	// while a call is pricing its model
+	loadMu sync.Mutex
+	loaded bool
+	mdev   map[string]mdProvider
 	// images are the models, by bare id, most of the providers serving
 	// them say take images (a few mislabel a text model)
 	images map[string]bool
@@ -151,6 +158,9 @@ var (
 	// efforts are the models' reasoning levels, by bare id, as most of the
 	// providers that give any for them give them
 	efforts map[string][]string
+	// thinks are the models, by bare id, most of the providers serving
+	// them say reason, levels or not
+	thinks map[string]bool
 
 	syncMu sync.Mutex
 )
@@ -180,83 +190,101 @@ func Source() string {
 }
 
 func load() map[string]mdProvider {
-	once.Do(func() {
-		for _, p := range []string{CachePath(), opencodeCache()} {
-			b, err := os.ReadFile(p)
-			if err != nil {
-				continue
-			}
-			var m map[string]mdProvider
-			if json.Unmarshal(b, &m) == nil && len(m) > 0 {
-				mdev = m
-				votes := map[string]int{}
-				sizes, outs := map[string]map[int]int{}, map[string]map[int]int{}
-				levels := map[string]map[string]int{}
-				// one vote a provider for each list it gives a model: a
-				// gateway listing it under each host it routes to
-				// (llmgateway's deepinfra/…, xiaomi/…) votes once, not once
-				// a host
-				voted := map[string]bool{}
-				for pid, p := range m {
-					for id, x := range p.Models {
-						if e := x.efforts(); len(e) > 0 {
-							l := strings.Join(e, ",")
-							if levels[bareID(id)] == nil {
-								levels[bareID(id)] = map[string]int{}
+	loadMu.Lock()
+	defer loadMu.Unlock()
+	if !loaded {
+		loaded = true
+		func() {
+			for _, p := range []string{CachePath(), opencodeCache()} {
+				b, err := os.ReadFile(p)
+				if err != nil {
+					continue
+				}
+				var m map[string]mdProvider
+				if json.Unmarshal(b, &m) == nil && len(m) > 0 {
+					mdev = m
+					votes, reasons := map[string]int{}, map[string]int{}
+					sizes, outs := map[string]map[int]int{}, map[string]map[int]int{}
+					levels := map[string]map[string]int{}
+					// one vote a provider for each list it gives a model: a
+					// gateway listing it under each host it routes to
+					// (llmgateway's deepinfra/…, xiaomi/…) votes once, not once
+					// a host
+					voted := map[string]bool{}
+					for pid, p := range m {
+						for id, x := range p.Models {
+							if e := x.efforts(); len(e) > 0 {
+								l := strings.Join(e, ",")
+								if levels[bareID(id)] == nil {
+									levels[bareID(id)] = map[string]int{}
+								}
+								if k := pid + "\x00" + bareID(id) + "\x00" + l; !voted[k] {
+									voted[k] = true
+									levels[bareID(id)][l]++
+								}
 							}
-							if k := pid + "\x00" + bareID(id) + "\x00" + l; !voted[k] {
-								voted[k] = true
-								levels[bareID(id)][l]++
+							if x.Thinks || len(x.efforts()) > 0 {
+								reasons[bareID(id)]++
+							} else {
+								reasons[bareID(id)]--
 							}
-						}
-						if slices.Contains(x.Modalities.Input, "image") {
-							votes[bareID(id)]++
-						} else {
-							votes[bareID(id)]--
-						}
-						if w := x.window(); w > 0 {
-							if sizes[bareID(id)] == nil {
-								sizes[bareID(id)] = map[int]int{}
+							if slices.Contains(x.Modalities.Input, "image") {
+								votes[bareID(id)]++
+							} else {
+								votes[bareID(id)]--
 							}
-							sizes[bareID(id)][w]++
-						}
-						if o := x.Limit.Output; o > 0 {
-							if outs[bareID(id)] == nil {
-								outs[bareID(id)] = map[int]int{}
+							if w := x.window(); w > 0 {
+								if sizes[bareID(id)] == nil {
+									sizes[bareID(id)] = map[int]int{}
+								}
+								sizes[bareID(id)][w]++
 							}
-							outs[bareID(id)][o]++
+							if o := x.Limit.Output; o > 0 {
+								if outs[bareID(id)] == nil {
+									outs[bareID(id)] = map[int]int{}
+								}
+								outs[bareID(id)][o]++
+							}
 						}
 					}
-				}
-				windows = map[string]int{}
-				for id, by := range sizes {
-					windows[id] = mostGiven(by)
-				}
-				outputs = map[string]int{}
-				for id, by := range outs {
-					outputs[id] = mostGiven(by)
-				}
-				efforts = map[string][]string{}
-				for id, by := range levels {
-					efforts[id] = strings.Split(mostListed(by), ",")
-				}
-				images = map[string]bool{}
-				for id, v := range votes {
-					if v > 0 {
-						images[id] = true
+					windows = map[string]int{}
+					for id, by := range sizes {
+						windows[id] = mostGiven(by)
 					}
+					outputs = map[string]int{}
+					for id, by := range outs {
+						outputs[id] = mostGiven(by)
+					}
+					efforts = map[string][]string{}
+					for id, by := range levels {
+						efforts[id] = strings.Split(mostListed(by), ",")
+					}
+					thinks = map[string]bool{}
+					for id, v := range reasons {
+						if v > 0 {
+							thinks[id] = true
+						}
+					}
+					images = map[string]bool{}
+					for id, v := range votes {
+						if v > 0 {
+							images[id] = true
+						}
+					}
+					return
 				}
-				return
 			}
-		}
-	})
+		}()
+	}
 	return mdev
 }
 
 // Reset forgets the loaded catalog so the next call re-reads the cache.
 func Reset() {
-	once = sync.Once{}
-	mdev, images, windows, outputs, efforts = nil, nil, nil, nil, nil
+	loadMu.Lock()
+	defer loadMu.Unlock()
+	loaded = false
+	mdev, images, windows, outputs, efforts, thinks = nil, nil, nil, nil, nil, nil
 }
 
 // Sync downloads the models.dev catalog into CachePath. It serializes with
@@ -297,14 +325,15 @@ func Sync(ctx context.Context) error {
 	return nil
 }
 
-// Stale reports whether no catalog exists or the cache is older than a week.
+// Stale reports whether no catalog exists or the cache is older than a day
+// (fresh.go).
 func Stale() bool {
 	src := Source()
 	if src == "" {
 		return true
 	}
 	st, err := os.Stat(src)
-	return err != nil || time.Since(st.ModTime()) > 7*24*time.Hour
+	return err != nil || time.Since(st.ModTime()) > staleAfter
 }
 
 // ProviderEnv lists the env vars that unlock a models.dev provider.
@@ -330,6 +359,38 @@ func PriceOf(providerID, modelID string) (Price, bool) {
 	if p, ok := load()[providerID]; ok {
 		if m, ok := p.Models[modelID]; ok && m.Cost != nil {
 			return *m.Cost, true
+		}
+	}
+	return Price{}, false
+}
+
+// PricedBy is the list price the first of providers (models.dev ids)
+// pricing a model of this id gives it: by its own key first, then by its
+// id without a path or case ("openai/GPT-6-Sol" is gpt-6-sol), a Bedrock
+// profile's geography, a "(variant)" or a ":tag".
+func PricedBy(providers []string, id string) (Price, bool) {
+	all := load()
+	for _, pid := range providers {
+		if m, ok := all[pid].Models[id]; ok && m.Cost != nil {
+			return *m.Cost, true
+		}
+	}
+	b := bareID(id)
+	if r, ok := unprofiled(b); ok {
+		b = r
+	}
+	for _, want := range []string{b, cutAt(b, '('), cutAt(b, ':')} {
+		for _, pid := range providers {
+			keys := make([]string, 0, len(all[pid].Models))
+			for key, m := range all[pid].Models {
+				if m.Cost != nil && bareID(key) == want {
+					keys = append(keys, key)
+				}
+			}
+			if len(keys) > 0 {
+				slices.Sort(keys)
+				return *all[pid].Models[keys[0]].Cost, true
+			}
 		}
 	}
 	return Price{}, false
@@ -370,6 +431,7 @@ func Provider(id string) []Model {
 		mm := Model{ID: m.ID, Name: m.Name, Provider: id, Released: m.ReleaseDate, Price: m.Cost, Temperature: m.Temperature,
 			Images: slices.Contains(m.Modalities.Input, "image"), ImageInput: imageInput(m.Modalities.Input), Context: m.window(), Output: m.Limit.Output}
 		mm.Efforts = m.efforts()
+		mm.Reasoning = m.Thinks || len(mm.Efforts) > 0
 		out = append(out, mm)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -385,6 +447,15 @@ func Provider(id string) []Model {
 // for "github-copilot"), or "" when the catalog doesn't know it.
 func ProviderName(id string) string {
 	return load()[id].Name
+}
+
+// Thinks reports whether models.dev says a model of this id reasons, as
+// most of the providers it lists serving it do, whether or not they give
+// it levels; for a vendor it doesn't list, serving a model it knows from
+// others.
+func Thinks(id string) bool {
+	load()
+	return thinks[bareID(id)]
 }
 
 // SeesImages reports whether models.dev says a model of this id takes
@@ -671,9 +742,11 @@ func Codex() []Model {
 
 func parseCodex(b []byte) ([]Model, error) {
 	var cache struct {
+		ETag   string `json:"etag"`
 		Models []struct {
 			Slug        string   `json:"slug"`
 			DisplayName string   `json:"display_name"`
+			Description string   `json:"description"`
 			Visibility  string   `json:"visibility"`
 			Priority    int      `json:"priority"`
 			Input       []string `json:"input_modalities"`
@@ -690,7 +763,7 @@ func parseCodex(b []byte) ([]Model, error) {
 	sort.SliceStable(cache.Models, func(i, j int) bool { return cache.Models[i].Priority < cache.Models[j].Priority })
 	var out []Model
 	for _, m := range cache.Models {
-		if m.Visibility == "hide" {
+		if m.Visibility == "hide" || MagpieAdded(cache.ETag, m.Slug, m.Description) {
 			continue
 		}
 		mm := Model{ID: m.Slug, Name: m.DisplayName, Provider: "openai", ImageInput: imageInput(m.Input)}
@@ -706,6 +779,17 @@ func parseCodex(b []byte) ([]Model, error) {
 		out = append(out, mm)
 	}
 	return out, nil
+}
+
+// MagpieAdded reports whether an entry of Codex's models_cache.json is one
+// of magpie's, not Codex's own: the list Codex keeps is the one it was last
+// handed, and handed through the gateway it has magpie's models in it too
+// ("group/semantic", "deepseek/deepseek-v4", "codex/gpt-5.5" — magpie's ids,
+// which Codex's slugs never look like). Read back as Codex's own, they were
+// listed under OpenAI, and kept there after Codex was routed elsewhere.
+func MagpieAdded(etag, slug, description string) bool {
+	return strings.HasSuffix(description, " via magpie") ||
+		strings.Contains(etag, "+magpie-") && strings.Contains(slug, "/")
 }
 
 // Efforts returns the reasoning levels a model supports, if known.

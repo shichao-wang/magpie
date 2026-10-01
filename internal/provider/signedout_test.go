@@ -14,6 +14,7 @@ func TestSavedButSignedOut(t *testing.T) {
 	isolate(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	if err := writeLogins([]savedLogin{
@@ -65,6 +66,7 @@ func TestSavedButSignedOutClaudeSaysWhy(t *testing.T) {
 	if w := why(); !strings.Contains(w, "nothing at "+filepath.Join(home, ".claude", ".credentials.json")) {
 		t.Fatalf("no credentials: %q", w)
 	}
+	shellFakes(t)
 	claudeSignIn(t, home, time.Now().Add(time.Hour))
 	exe := filepath.Join(home, "claude")
 	os.WriteFile(exe, []byte("#!/bin/sh\necho '{\"loggedIn\": false}'\n"), 0o755)
@@ -74,10 +76,49 @@ func TestSavedButSignedOutClaudeSaysWhy(t *testing.T) {
 	}
 }
 
+// A saved Claude account whose Claude Code is signed out (a banned account
+// logged out, say) names its accounts, so they can be removed from magpie
+// while none is offered; removing one drops it from magpie's store and
+// leaves Claude Code's own files as they are.
+func TestSavedButSignedOutCanBeRemoved(t *testing.T) {
+	home := claudeHome(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	if err := writeLogins([]savedLogin{
+		{Agent: "claude", User: "banned@x.com", Auth: []byte(`{}`)},
+		{Agent: "codex", User: "c@x.com", Auth: []byte(`{}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var claude *Exclusion
+	for _, x := range Excluded() {
+		if x.Agent == "claude" && x.SignedOut {
+			claude = &x
+		}
+	}
+	if claude == nil || len(claude.Users) != 1 || claude.Users[0] != "banned@x.com" {
+		t.Fatalf("claude: %+v", claude)
+	}
+	if err := ForgetLogin("claude", "banned@x.com"); err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range Excluded() {
+		if x.Agent == "claude" {
+			t.Errorf("removed, yet: %+v", x)
+		}
+	}
+	if ls := readLogins(); len(ls) != 1 || ls[0].Agent != "codex" {
+		t.Errorf("logins: %+v", ls)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude")); !os.IsNotExist(err) {
+		t.Errorf("Claude Code's folder was touched: %v", err)
+	}
+}
+
 // Claude Code's sign-in is read from the keychain as Claude Code reads it,
 // under its account: another item for the same service (one an earlier
 // sign-in left) that comes first by service alone isn't taken for it.
 func TestClaudeKeychainReadsItsAccount(t *testing.T) {
+	shellFakes(t)
 	home := claudeHome(t)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("USER", "tester")

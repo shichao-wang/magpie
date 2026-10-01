@@ -9,10 +9,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -78,20 +81,97 @@ func FetchIcon(ctx context.Context, rawURL string) (string, error) {
 
 // guardClient is the http.Client icon fetches use: the default transport —
 // so the proxy settings still apply — but with dialing wrapped in publicDial.
+//
+// Through a proxy the connection goes to the proxy, often on this computer
+// (Clash's 127.0.0.1:7890), so the proxy's own address is dialed as it is;
+// the site's name is judged before the proxy is asked for, since the proxy
+// resolves it where magpie can't see.
 func guardClient() *http.Client {
 	c := *http.DefaultClient
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	dial := t.DialContext
+	var proxies sync.Map // host:port of the proxies this client was sent to
+	if proxy := t.Proxy; proxy != nil {
+		t.Proxy = func(req *http.Request) (*url.URL, error) {
+			u, err := proxy(req)
+			if err != nil || u == nil {
+				return u, err
+			}
+			if err := publicHost(req.Context(), req.URL.Hostname()); err != nil {
+				return nil, err
+			}
+			proxies.Store(proxyAddr(u), true)
+			return u, nil
+		}
+	}
 	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if _, ok := proxies.Load(addr); ok {
+			return dial(ctx, network, addr)
+		}
 		return publicDial(ctx, dial, network, addr)
 	}
 	c.Transport = t
 	return &c
 }
 
+// publicHost checks a site's answers with the same rules as publicDial,
+// for a fetch the proxy will make. A name that doesn't resolve
+// here is left to the proxy, which may be the only way to reach it.
+func publicHost(ctx context.Context, host string) error {
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil
+	}
+	_, err = iconIPs(host, ips)
+	return err
+}
+
+// Loon synthesizes AAAA records by embedding its fake IPv4 in fd27:712::/96.
+// Prefer the matching A record already accepted by our IPv4 guard. Do not
+// dial the private IPv6 address or exempt the whole ULA prefix: an unpaired
+// record (or any other private answer) still fails the check.
+var loonIconPrefix = netip.MustParsePrefix("fd27:712::/96")
+
+func iconIPs(host string, ips []net.IPAddr) ([]net.IPAddr, error) {
+	var allowed []net.IPAddr
+	for _, ip := range ips {
+		if publicIP(ip.IP) {
+			allowed = append(allowed, ip)
+			continue
+		}
+		if addr, ok := netip.AddrFromSlice(ip.IP); ok && loonIconPrefix.Contains(addr) {
+			paired := false
+			for _, other := range ips {
+				if v4 := other.IP.To4(); v4 != nil && publicIP(v4) && v4.Equal(ip.IP[12:]) {
+					paired = true
+					break
+				}
+			}
+			if paired {
+				continue
+			}
+		}
+		return nil, errorf("the icon host %s resolves to %s, which is not public", host, ip.IP)
+	}
+	return allowed, nil
+}
+
+// proxyAddr is the host:port the transport dials to reach proxy u.
+func proxyAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"https": "443", "socks5": "1080", "socks5h": "1080"}[u.Scheme]
+		if port == "" {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
 // publicDial resolves the host and refuses to connect when any address it
-// maps to is not public. Checking the resolved address here, not just the
-// URL's hostname, closes the door on a name that answers public once and
+// maps to is not public (except a paired Loon AAAA discarded by iconIPs).
+// Checking the resolved address here, not just the URL's hostname, closes
+// the door on a name that answers public once and
 // private the next time (DNS rebinding): the same resolution this dial uses
 // is the one that is judged.
 func publicDial(ctx context.Context, dial func(context.Context, string, string) (net.Conn, error), network, addr string) (net.Conn, error) {
@@ -106,10 +186,9 @@ func publicDial(ctx context.Context, dial func(context.Context, string, string) 
 	if len(ips) == 0 {
 		return nil, errorf("could not resolve %s", host)
 	}
-	for _, ip := range ips {
-		if !publicIP(ip.IP) {
-			return nil, errorf("the icon host %s resolves to %s, which is not public", host, ip.IP)
-		}
+	ips, err = iconIPs(host, ips)
+	if err != nil {
+		return nil, err
 	}
 	// Dial each resolved address by IP, so nothing resolves twice.
 	var lastErr error
@@ -125,6 +204,13 @@ func publicDial(ctx context.Context, dial func(context.Context, string, string) 
 
 // publicIP is true for an address on the open internet: not loopback,
 // private, link-local, unspecified, multicast or otherwise reserved.
+//
+// 198.18.0.0/15, RFC 2544's benchmarking range, is let through: Clash's TUN
+// mode with fake-ip and Surge's enhanced mode answer every name with an
+// address there and carry the connection to the real host through the proxy
+// (#252). No machine on the user's network sits in that range, so a fetch
+// aimed at it reaches the internet host the name stands for, not this
+// computer or the LAN.
 func publicIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
@@ -132,16 +218,14 @@ func publicIP(ip net.IP) bool {
 		return false
 	}
 	if v4 := ip.To4(); v4 != nil {
-		// 100.64/10 carrier NAT, 192.0.0.0/24, 192.0.2/24, 198.18/15 and
-		// friends: never a public web host.
+		// 100.64/10 carrier NAT, 192.0.0.0/24, 192.0.2/24 and friends:
+		// never a public web host.
 		switch {
 		case v4[0] == 100 && v4[1]&0xc0 == 64:
 			return false
 		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0:
 			return false
 		case v4[0] == 192 && v4[1] == 0 && v4[2] == 2:
-			return false
-		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19):
 			return false
 		case v4[0] == 198 && v4[1] == 51 && v4[2] == 100:
 			return false
@@ -225,14 +309,18 @@ func iconExt(b []byte) string {
 	return ""
 }
 
-// pruneIcons removes pictures no provider points at any more. One picked in
-// the editor is stored before its provider is saved, so a fresh one stays.
+// pruneIcons removes pictures no provider points at any more, nor a plugin
+// gave its provider (PluginIcon). One picked in the editor is stored
+// before its provider is saved, so a fresh one stays.
 func pruneIcons(f file) {
 	used := map[string]bool{}
 	for _, p := range f.Providers {
 		if name, ok := strings.CutPrefix(p.Icon, iconPrefix); ok {
 			used[name] = true
 		}
+	}
+	for _, name := range keptPluginIcons() {
+		used[name] = true
 	}
 	ents, _ := os.ReadDir(IconDir())
 	for _, e := range ents {

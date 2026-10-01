@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -66,6 +67,23 @@ const (
 // sends none; one whose tool ran longer gets its answer all the same, from a
 // run started with the whole conversation, as its next turn would be.
 var parkLongest = 5 * time.Minute
+
+// A run whose reply called nothing but a tool that ends its caller's turn
+// (finalTools: an Agent SDK or workflow subagent's StructuredOutput, answered
+// by the client itself) hears no result for it when the call was good, the
+// subagent done: it waits finalGrace, for the error result a call that
+// broke its schema gets at once, and is let go (#345).
+var (
+	finalGrace = 30 * time.Second
+	finalTools = map[string]bool{"StructuredOutput": true}
+)
+
+// Of the runs waiting on their caller's tool calls, parkedMost are kept
+// once they have waited parkLongest, the longest waiting let go first: a
+// caller stopped with its calls unanswered (a subagent its workflow ended)
+// sends none, and each is a Claude Code process. One let go that does get
+// its results is started anew with the whole conversation.
+const parkedMost = 16
 
 type subscriptionRun struct {
 	bridge *subscriptionBridge
@@ -117,6 +135,11 @@ type subscriptionRun struct {
 	// reply's two tool calls the second is made only once the first has its
 	// result, while the client ran both and sent both results back at once.
 	early map[string]mcpToolResult
+
+	// asked is the client's tools its reply called, and parkedAt when it
+	// began waiting on them
+	asked    []string
+	parkedAt time.Time
 }
 
 // waitTool collects a tool result that took longer than an agent's patience.
@@ -221,7 +244,7 @@ func callbackBaseURL() string {
 	return "http://" + host + ":" + port
 }
 
-func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, oauth, owner string) (*subscriptionRun, <-chan Event, error) {
+func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, configDir, owner string) (*subscriptionRun, <-chan Event, error) {
 	binary, err := claudeBinary()
 	if err != nil {
 		return nil, nil, err
@@ -253,11 +276,8 @@ func (b *subscriptionBridge) start(ctx context.Context, req *Request, model, oau
 	args := claudeCLIArgs(model, string(mcpConfig), req.Effort, req.WebSearch)
 	cmd := proc.CommandContext(context.Background(), binary, args...)
 	cmd.Dir = tmp
-	cmd.Env = netproxy.Env(cleanClaudeEnv(os.Environ()))
-	if oauth != "" {
-		// a saved account in use beside the one Claude Code is signed in to
-		cmd.Env = append(cmd.Env, "CLAUDE_CODE_OAUTH_TOKEN="+oauth)
-	}
+	cmd.Env = netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
+	cmd.Env = inClaudeDir(cmd.Env, configDir)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cleanup()
@@ -382,19 +402,19 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 		r.abort()
 		return
 	case stop == "tool":
-		if r.stdin == nil && r.timer != nil {
-			r.timer.Reset(parkLongest)
-		}
+		r.park()
 		return // it waits on its tool calls
 	case r.stdin == nil:
 		return // it ends by itself
 	case stop != "stop":
 		r.abort()
 		return
-	case len(req.Tools) == 0 && len(req.Messages) < 2:
+	case len(req.Tools) == 0 && !hasReply(req.Messages):
 		// a one-off ask — an agent's title or topic, the router's
-		// classifier — has no next turn: kept, it would be a Claude Code
-		// process idle for idleLongest, several at once
+		// classifier, Claude Code's auto mode classifier with its
+		// transcript in several user messages (#250) — has no next turn:
+		// kept, it would be a Claude Code process idle for idleLongest,
+		// several at once, pushing out the conversations' own
 		r.abort()
 		return
 	}
@@ -426,6 +446,56 @@ func (r *subscriptionRun) ended(req *Request, said, stop string, ok bool) {
 	r.timer.Reset(idleLongest)
 	for _, run := range drop {
 		run.abort()
+	}
+}
+
+// park leaves the run waiting on its reply's tool calls: parkLongest for
+// a run started anew for each turn, finalGrace when they end the caller's
+// turn, and among the parkedMost longest waiting otherwise.
+func (r *subscriptionRun) park() {
+	r.mu.Lock()
+	final := len(r.asked) > 0
+	for _, name := range r.asked {
+		final = final && finalTools[name]
+	}
+	now := time.Now()
+	r.parkedAt = now
+	r.mu.Unlock()
+	switch {
+	case r.timer == nil:
+		return
+	case final:
+		r.timer.Reset(finalGrace)
+		return
+	case r.stdin == nil:
+		r.timer.Reset(parkLongest)
+		return
+	}
+	b := r.bridge
+	if b == nil {
+		return
+	}
+	type waiting struct {
+		run *subscriptionRun
+		at  time.Time
+	}
+	var parked []waiting
+	b.mu.Lock()
+	for _, run := range b.runs {
+		run.mu.Lock()
+		at, closed := run.parkedAt, run.closed
+		run.mu.Unlock()
+		if !closed && !at.IsZero() && now.Sub(at) >= parkLongest {
+			parked = append(parked, waiting{run, at})
+		}
+	}
+	b.mu.Unlock()
+	if len(parked) <= parkedMost {
+		return
+	}
+	slices.SortFunc(parked, func(a, b waiting) int { return a.at.Compare(b.at) })
+	for _, w := range parked[:len(parked)-parkedMost] {
+		w.run.abort()
 	}
 }
 
@@ -509,12 +579,30 @@ func claudeCLIArgs(model, mcpConfig, effort string, web bool) []string {
 		"--no-session-persistence",
 	}
 	if effort != "" {
-		if effort == "xhigh" {
-			effort = "max"
-		}
+		// Claude Code takes xhigh as its own level, below max (#385)
 		args = append(args, "--effort", effort, "--thinking-display", "summarized")
 	}
 	return args
+}
+
+// inClaudeDir is env for a Claude Code run on a saved account in use beside
+// the one it is signed in to: in the account's config directory
+// (provider's claude_dirs.go), where Claude Code keeps the sign-in fresh
+// itself. configDir "" is the account Claude Code is signed in to, and env
+// is kept as it is.
+func inClaudeDir(env []string, configDir string) []string {
+	if configDir == "" {
+		return env
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		switch k, _, _ := strings.Cut(e, "="); k {
+		case "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR":
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out, "CLAUDE_CONFIG_DIR="+configDir)
 }
 
 func cleanClaudeEnv(env []string) []string {
@@ -588,6 +676,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 	// what the messages before cost, as each message's usage counts only
 	// itself and the client keeps the last it is told
 	var before, this Usage
+	var reqID, errKind string // the last request's id, and how it failed
 	usage := func(u cliUsage) Usage {
 		v := u.gateway()
 		this.add(v)
@@ -599,6 +688,12 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			Subtype string `json:"subtype"`
 			IsError bool   `json:"is_error"`
 			Result  string `json:"result"`
+			// Anthropic's id for the request, on the messages it answered,
+			// and on a failure the HTTP status Claude Code got and its
+			// name for the kind of error (rate_limit, server_error…)
+			RequestID      string          `json:"request_id"`
+			APIErrorStatus int             `json:"api_error_status"`
+			ErrorKind      json.RawMessage `json:"error"`
 			// what Claude Code's WebSearch found, on the message that
 			// answers its call
 			ToolUseResult json.RawMessage `json:"tool_use_result"`
@@ -643,9 +738,20 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 			// this and no message_stop, the CLI waiting on its next input:
 			// the reply ends here, or it would wait with it (#177)
 			if envelope.IsError {
-				r.emit(Event{Kind: KError, Text: envelope.Result})
+				r.emit(Event{Kind: KError, Text: envelope.Result, Status: envelope.APIErrorStatus, Code: errKind, RequestID: reqID})
 				r.endSegment()
 			}
+			continue
+		}
+		if envelope.Type == "assistant" {
+			// the whole message, whose id its stream's later events go
+			// out under; a failure says how it failed here, before its result
+			if envelope.RequestID != "" {
+				reqID = envelope.RequestID
+			}
+			var kind string
+			_ = json.Unmarshal(envelope.ErrorKind, &kind)
+			errKind = kind
 			continue
 		}
 		var searched struct {
@@ -679,6 +785,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				continue
 			}
 			before, this = Usage{}, Usage{}
+			r.mu.Lock()
+			r.asked = nil
+			r.mu.Unlock()
 			r.emit(Event{Kind: KStart, MsgID: e.Message.ID, Model: e.Message.Model, Usage: usage(e.Message.Usage)})
 		case "content_block_start":
 			switch e.ContentBlock.Type {
@@ -694,6 +803,9 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 					continue
 				}
 				theirs = true
+				r.mu.Lock()
+				r.asked = append(r.asked, name)
+				r.mu.Unlock()
 				r.emit(Event{Kind: KToolStart, ID: e.ContentBlock.ID, Name: name})
 			case "text":
 				if e.ContentBlock.Text != "" {
@@ -714,7 +826,7 @@ func (r *subscriptionRun) readOutput(rd io.Reader) {
 				}
 			}
 		case "message_delta":
-			r.emit(Event{Kind: KUsage, Usage: usage(e.Usage)})
+			r.emit(Event{Kind: KUsage, Usage: usage(e.Usage), RequestID: reqID})
 			if e.Delta.StopReason == "tool_use" && len(own) > 0 && !theirs {
 				inside = true
 			} else if e.Delta.StopReason != "" {
@@ -842,18 +954,27 @@ func renderParts(blocks []map[string]any, text *strings.Builder, parts []Part) [
 			fmt.Fprintf(text, "\n[tool call %s id=%s args=%s]", p.Name, p.ID, argsString(p))
 		case ToolResult:
 			fmt.Fprintf(text, "\n[tool result id=%s%s]\n%s", p.CallID, map[bool]string{true: " error"}[p.IsError], p.Text)
+			// the images the tool returned follow its text
+			for _, im := range p.Images {
+				blocks = imageBlocks(blocks, text, im)
+			}
 		case Image:
-			if text.Len() > 0 {
-				blocks = append(blocks, map[string]any{"type": "text", "text": text.String()})
-				text.Reset()
-			}
-			switch {
-			case p.Data != "":
-				blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": p.MediaType, "data": p.Data}})
-			case p.URL != "":
-				blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": p.URL}})
-			}
+			blocks = imageBlocks(blocks, text, p)
 		}
+	}
+	return blocks
+}
+
+func imageBlocks(blocks []map[string]any, text *strings.Builder, p Part) []map[string]any {
+	if text.Len() > 0 {
+		blocks = append(blocks, map[string]any{"type": "text", "text": text.String()})
+		text.Reset()
+	}
+	switch {
+	case p.Data != "":
+		blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": p.MediaType, "data": p.Data}})
+	case p.URL != "":
+		blocks = append(blocks, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": p.URL}})
 	}
 	return blocks
 }
@@ -871,20 +992,32 @@ func closeBlocks(blocks []map[string]any, text *strings.Builder) []map[string]an
 // findRun is the run the request's new tool results are for, and those
 // results: the ones sent since the last assistant message. They are the
 // run's when one of them is a call it made; the rest it hasn't made yet.
+// An image sent beside the results, as a client whose tool messages hold
+// text only sends a tool's (Chat), goes with the result before it.
 func (b *subscriptionBridge) findRun(req *Request) (*subscriptionRun, []Part) {
-	var fresh []Part
-	for i := len(req.Messages) - 1; i >= 0 && req.Messages[i].Role != "assistant"; i-- {
-		var parts []Part
-		for _, p := range req.Messages[i].Parts {
-			if p.Kind == ToolResult {
-				parts = append(parts, p)
+	i := len(req.Messages)
+	for i > 0 && req.Messages[i-1].Role != "assistant" {
+		i--
+	}
+	var fresh, loose []Part
+	for _, m := range req.Messages[i:] {
+		for _, p := range m.Parts {
+			switch {
+			case p.Kind == ToolResult:
+				p.Images = slices.Clone(p.Images)
+				fresh = append(fresh, p)
+			case p.Kind == Image && len(fresh) > 0:
+				last := &fresh[len(fresh)-1]
+				last.Images = append(last.Images, p)
+			case p.Kind == Image:
+				loose = append(loose, p)
 			}
 		}
-		fresh = append(parts, fresh...)
 	}
 	if len(fresh) == 0 {
 		return nil, nil
 	}
+	fresh[0].Images = append(loose, fresh[0].Images...)
 	// Claude emits message_stop just before its MCP calls are all scheduled.
 	// A very fast client can return a result while the callback is still being
 	// registered; give that tiny race a bounded grace period.
@@ -930,13 +1063,16 @@ func (r *subscriptionRun) continueWith(results []Part) (<-chan Event, error) {
 	if r.timer != nil {
 		r.timer.Reset(30 * time.Minute)
 	}
+	r.mu.Lock()
+	r.parkedAt = time.Time{}
+	r.mu.Unlock()
 	ch := r.attach()
 	if r.begin != nil {
 		r.emit(r.begin())
 	}
 	delivered := 0
 	for _, p := range results {
-		result := mcpToolResult{Content: []map[string]any{{"type": "text", "text": p.Text}}, IsError: p.IsError}
+		result := mcpResult(p)
 		r.mu.Lock()
 		waiter := r.pending[p.CallID]
 		delete(r.pending, p.CallID)
@@ -965,6 +1101,34 @@ func (r *subscriptionRun) continueWith(results []Part) (<-chan Event, error) {
 		r.resume()
 	}
 	return ch, nil
+}
+
+// mcpResult is a tool result as an MCP tools/call answers: its text, then
+// the images the tool returned as MCP image content, which Claude Code hands
+// its model as image blocks. MCP carries an image's bytes only, so one known
+// by its URL alone is named in text.
+func mcpResult(p Part) mcpToolResult {
+	content := []map[string]any{{"type": "text", "text": p.Text}}
+	for _, im := range p.Images {
+		switch {
+		case im.Data != "":
+			content = append(content, map[string]any{"type": "image", "data": im.Data, "mimeType": imageMediaType(im)})
+		case im.URL != "":
+			content = append(content, map[string]any{"type": "text", "text": "[image: " + im.URL + "]"})
+		}
+	}
+	return mcpToolResult{Content: content, IsError: p.IsError}
+}
+
+// imageMediaType is an inline image's type, read from its bytes when the
+// client did not say.
+func imageMediaType(p Part) string {
+	if p.MediaType != "" {
+		return p.MediaType
+	}
+	head := p.Data[:min(len(p.Data), 64)]
+	b, _ := base64.StdEncoding.DecodeString(head[:len(head)/4*4])
+	return http.DetectContentType(b)
 }
 
 func callIDs(parts []Part) string {
@@ -1180,16 +1344,23 @@ func (b *subscriptionBridge) removeRun(run *subscriptionRun) {
 
 func (s *Server) serveClaudeSubscription(w http.ResponseWriter, r *http.Request, from provider.Protocol, p provider.Provider, model string, body []byte, usage *Usage) (int, string) {
 	start := func(ctx context.Context, req *Request) (*subscriptionRun, <-chan Event, error) {
+		ctx = p.Via(ctx) // the account's own proxy, its CLI run's too
 		owner := p.ID + "\x00" + p.Account.User
 		if run, events := s.subscription.resume(req, owner); run != nil {
 			return run, events, nil
 		}
 		s.subscription.retire(owner, req.Messages)
-		token, _, err := p.Account.Token(ctx)
+		if req.Effort == "" && autoModeClassifier(req) {
+			// Claude Code's auto mode classifier asks a verdict of a few
+			// words within a minute; a Claude Code run at its default
+			// effort can think past that (#250)
+			req.Effort = "low"
+		}
+		dir, _, err := p.Account.Token(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		return s.subscription.start(ctx, req, model, token, owner)
+		return s.subscription.start(ctx, req, model, dir, owner)
 	}
 	return s.serveSubscription(w, r, from, "Claude Code", model, body, usage, start)
 }
@@ -1280,8 +1451,14 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 			}
 			abort()
 			code := 502
-			if quotaWords.MatchString(msg) {
-				code = 429
+			if n > 0 {
+				usage.add(Usage{ErrType: head[n-1].Code, RequestID: head[n-1].RequestID})
+				// the status Claude Code got, else a guess from the words
+				if head[n-1].Status >= 400 {
+					code = head[n-1].Status
+				} else if quotaWords.MatchString(msg) {
+					code = 429
+				}
 			}
 			return writeError(w, from, code, name+": "+msg), msg
 		}
@@ -1293,7 +1470,7 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 				failed = ev.Text
 			case KStart, KUsage:
 				usage.add(ev.Usage)
-				usage.add(Usage{Served: ev.Model})
+				usage.add(Usage{Served: ev.Model, RequestID: ev.RequestID})
 			case KText:
 				said += ev.Text
 			case KStop:
@@ -1330,7 +1507,10 @@ func relay(w http.ResponseWriter, r *http.Request, from provider.Protocol, name 
 		abort()
 		// a status, as in a stream, so another account can take over
 		code := 502
-		if quotaWords.MatchString(col.err) {
+		usage.add(Usage{ErrType: col.errCode})
+		if col.errStatus >= 400 {
+			code = col.errStatus
+		} else if quotaWords.MatchString(col.err) {
 			code = 429
 		}
 		return writeError(w, from, code, name+": "+col.err), col.err

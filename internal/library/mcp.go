@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/imagemcp"
 )
 
 // Server is one MCP server: a command magpie's agents start, or a URL they
@@ -108,6 +110,31 @@ const (
 	fmtDesktop
 	fmtZCode
 	fmtDsh
+	// fmtPiNative is the mcp.json Pi 0.99 reads itself (pimcp.go)
+	fmtPiNative
+	// fmtAntigravity is Antigravity's mcp_config.json: a remote server is
+	// its serverUrl, whatever it speaks
+	fmtAntigravity
+	// fmtHermes is Hermes Agent's mcp_servers in its config.yaml: a url is
+	// streamable HTTP unless transport says sse, a command stdio
+	fmtHermes
+	// fmtOmp is omp's mcp.json, and Qoder's settings.json: "type" says
+	// http or sse beside a url, a command needs none
+	fmtOmp
+	// fmtKimi is Kimi Code's mcp.json, the Python kimi-cli's and the new
+	// one's alike: "transport" http or sse beside a url
+	fmtKimi
+	// fmtDevin is Devin's mcp_config.json, a transport on every entry
+	// (stdio, http, sse) as `devin mcp add` writes it
+	fmtDevin
+	// fmtGrok is Grok Build's [mcp_servers.<name>] tables in config.toml
+	fmtGrok
+	// fmtCline is Cline's CLI's cline_mcp_settings.json, where an entry's
+	// transport is an object of its own (type stdio, streamableHttp, sse)
+	fmtCline
+	// fmtCommandCode is Command Code's mcp.json: transport stdio or http,
+	// and enabled
+	fmtCommandCode
 )
 
 // mcpFile is the file an agent keeps its user-wide MCP servers in.
@@ -115,13 +142,17 @@ type mcpFile struct {
 	Path   string
 	Format mcpFormat
 	// Also are files given the same servers, read from Path: dsh's other
-	// profiles, pi-mcp-extension's mcp.json beside pi-mcp-adapter's file
-	// (each with the user's own fields in its entry kept).
+	// profiles, pi-mcp-extension's mcp.json beside pi-mcp-adapter's file,
+	// Claude Desktop's Claude-3p file (each with the user's own fields in
+	// its entry kept).
 	Also []string
 	// Extra are files servers are found in too, for bringing into the
 	// library, but not written: Pi's mcp.json that pi-mcp-adapter no longer
 	// reads, with what couldn't be moved from it.
 	Extra []string
+	// WSL: the agent runs in a WSL distro, where a Windows program isn't
+	// one it can start
+	WSL bool
 }
 
 // files are every file the servers are written into.
@@ -130,7 +161,7 @@ func (f *mcpFile) files() []string { return append([]string{f.Path}, f.Also...) 
 // key is the object the servers are kept under.
 func (f *mcpFile) key() string {
 	switch f.Format {
-	case fmtCodex:
+	case fmtCodex, fmtHermes, fmtGrok:
 		return "mcp_servers"
 	case fmtOpenCode, fmtCrush:
 		return "mcp"
@@ -147,21 +178,30 @@ func (f *mcpFile) supports(s *Server) error {
 	if f.Format == fmtDesktop && s.Remote() {
 		return errNoRemote
 	}
-	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh) {
+	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode) {
 		return errNoSSE
 	}
 	if f.Format == fmtDsh && s.Name != "" && !dshServerName.MatchString(s.Name) {
 		return errDshName
 	}
+	if f.WSL && !s.Remote() && windowsPath.MatchString(s.Command) {
+		return fmt.Errorf("it runs a Windows program (%s), which an agent in WSL can't start: give it a command WSL has", s.Command)
+	}
 	return nil
 }
+
+// windowsPath is a program named as Windows names one: C:/…, a path with a
+// backslash in it, or …/npx.cmd.
+var windowsPath = regexp.MustCompile(`^[A-Za-z]:[\\/]|\\|(?i)\.(?:exe|cmd|bat|ps1)$`)
 
 // errNoRemote is what the page says of an app that reaches only a server
 // it runs itself (Claude Desktop, whose remote ones are its Connectors).
 var errNoRemote = errors.New("no-remote")
 
 // errNoSSE is what the page says of an agent that can't reach a server
-// over SSE (Codex, Goose, DeepSeek Harness).
+// over SSE (Codex, Goose, DeepSeek Harness, Pi's own MCP, Grok Build — its
+// type = "sse" is taken, but it speaks streamable HTTP to it all the same,
+// Command Code, whose own add refuses sse).
 var errNoSSE = errors.New("no-sse")
 
 // ordered is a JSON object that keeps its keys in the order given, so an
@@ -205,6 +245,64 @@ func list(a []string) []string {
 		return []string{}
 	}
 	return a
+}
+
+// MarshalYAML writes the object as a YAML mapping in the same order.
+func (o ordered) MarshalYAML() (any, error) {
+	n := &yaml.Node{Kind: yaml.MappingNode}
+	for _, e := range o {
+		var v yaml.Node
+		if err := v.Encode(e.v); err != nil {
+			return nil, err
+		}
+		n.Content = append(n.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: e.k}, &v)
+	}
+	return n, nil
+}
+
+// selfTimeout is the seconds an agent waits for a tool of s: what
+// magpie-image's video tool needs, else def.
+func selfTimeout(s *Server, def int) int {
+	if s.Name == selfServerName && s.Command != "" {
+		return int(imagemcp.ToolTimeout().Seconds())
+	}
+	return def
+}
+
+// gooseOldTimeout is the timeout magpie wrote for every Goose server before
+// magpie-image was given a longer one.
+const gooseOldTimeout = 300
+
+// behind says whether an entry magpie wrote before lacks the timeout it
+// gives s now: Codex's tool_timeout_sec is missing, or Goose's timeout is
+// still the gooseOldTimeout every server had. A value the user chose is
+// neither, so it is left as it is.
+func (f *mcpFile) behind(s *Server, old map[string]any) bool {
+	if selfTimeout(s, 0) == 0 {
+		return false
+	}
+	switch f.Format {
+	case fmtCodex:
+		_, ok := old["tool_timeout_sec"]
+		return !ok
+	case fmtGoose:
+		return isNumber(old["timeout"], gooseOldTimeout)
+	}
+	return false
+}
+
+func isNumber(v any, n float64) bool {
+	switch x := v.(type) {
+	case int:
+		return float64(x) == n
+	case int64:
+		return float64(x) == n
+	case uint64:
+		return float64(x) == n
+	case float64:
+		return x == n
+	}
+	return false
 }
 
 // encode is the server as this agent writes it.
@@ -289,7 +387,7 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("args", list(s.Args))
 			optional("envs", s.Env)
 		}
-		add("timeout", 300)
+		add("timeout", selfTimeout(s, 300))
 	case fmtPi:
 		// pi-mcp-extension reads the transport from "transport",
 		// pi-mcp-adapter from "httpTransport"; each ignores the other's
@@ -307,6 +405,110 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("args", list(s.Args))
 			optional("env", s.Env)
 		}
+	case fmtPiNative:
+		// "type" is optional: a url is streamable HTTP, a command stdio
+		if s.Remote() {
+			add("url", s.URL)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
+	case fmtHermes:
+		// Hermes' own `hermes mcp add` writes url/headers or
+		// command/args/env; transport: sse is its only other transport
+		// (tools/mcp_tool.py)
+		if s.Remote() {
+			add("url", s.URL)
+			optional("headers", s.Headers)
+			if s.Transport == "sse" {
+				add("transport", "sse")
+			}
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
+	case fmtOmp:
+		if s.Remote() {
+			add("type", s.Transport)
+			add("url", s.URL)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
+	case fmtKimi, fmtDevin:
+		// as `kimi mcp add` and `devin mcp add` write them; Kimi's
+		// transport is left out for a command, as its own add leaves it
+		if s.Remote() {
+			add("url", s.URL)
+			add("transport", s.Transport)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+			if f.Format == fmtDevin {
+				add("transport", "stdio")
+			}
+		}
+	case fmtCline:
+		// as `cline mcp add` writes it; a url with no type would be SSE
+		if s.Remote() {
+			t := ordered{{"type", "streamableHttp"}, {"url", s.URL}}
+			if s.Transport == "sse" {
+				t[0].v = "sse"
+			}
+			if len(s.Headers) > 0 {
+				t = append(t, kv{"headers", s.Headers})
+			}
+			add("transport", t)
+		} else {
+			t := ordered{{"type", "stdio"}, {"command", s.Command}, {"args", list(s.Args)}}
+			if len(s.Env) > 0 {
+				t = append(t, kv{"env", s.Env})
+			}
+			add("transport", t)
+		}
+	case fmtCommandCode:
+		if s.Remote() {
+			add("transport", "http")
+			add("enabled", true)
+			add("url", s.URL)
+			optional("headers", s.Headers)
+		} else {
+			add("transport", "stdio")
+			add("enabled", true)
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
+	case fmtGrok:
+		if s.Remote() {
+			add("url", s.URL)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
+	case fmtAntigravity:
+		// Antigravity tells SSE from streamable HTTP itself; "type" only
+		// lets magpie read an SSE server back as one (agy keeps the key)
+		if s.Remote() {
+			if s.Transport == "sse" {
+				add("type", "sse")
+			}
+			add("serverUrl", s.URL)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
 	case fmtCodex:
 		if s.Remote() {
 			add("url", s.URL)
@@ -315,6 +517,10 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("command", s.Command)
 			add("args", list(s.Args))
 			optional("env", s.Env)
+		}
+		// Codex gives a tool a minute unless its entry says more
+		if t := selfTimeout(s, 0); t > 0 {
+			add("tool_timeout_sec", t)
 		}
 	case fmtDsh:
 		add("serverName", s.Name)
@@ -382,6 +588,21 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 		case "sse":
 			remote("sse", str(m, "uri"), m["headers"])
 		}
+	case fmtAntigravity:
+		// agy reads a url where there's no serverUrl too
+		u := str(m, "serverUrl")
+		if u == "" {
+			u = str(m, "url")
+		}
+		if u != "" {
+			t := "http"
+			if str(m, "type") == "sse" {
+				t = "sse"
+			}
+			remote(t, u, m["headers"])
+		} else {
+			local(str(m, "command"), m["args"], m["env"])
+		}
 	case fmtCodex:
 		if u := str(m, "url"); u != "" {
 			remote("http", u, m["http_headers"])
@@ -413,17 +634,66 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 		case "streamable-http":
 			remote("http", str(m, "url"), m["headers"])
 		}
-	case fmtPi:
+	case fmtHermes, fmtKimi, fmtDevin:
+		// each takes a url over a command when an entry has both
 		if u := str(m, "url"); u != "" {
 			t := "http"
-			if str(m, "transport") == "sse" || str(m, "httpTransport") == "sse" {
+			if str(m, "transport") == "sse" {
 				t = "sse"
 			}
 			remote(t, u, m["headers"])
 		} else {
 			local(str(m, "command"), m["args"], m["env"])
 		}
-	default: // Claude Code, Cursor, Copilot, Crush, ZCode
+	case fmtCline:
+		// the flat shape Cline's extension wrote is read too, a url with
+		// no type being SSE there
+		t, nested := m["transport"].(map[string]any)
+		if !nested {
+			t = m
+		}
+		ty := str(t, "type")
+		if ty == "" && !nested {
+			ty = str(t, "transportType")
+		}
+		if u := str(t, "url"); u != "" {
+			tr := "sse"
+			if ty == "streamableHttp" || ty == "http" {
+				tr = "http"
+			}
+			remote(tr, u, t["headers"])
+		} else {
+			local(str(t, "command"), t["args"], t["env"])
+		}
+	case fmtCommandCode:
+		// Command Code reads type for transport too, and speaks
+		// streamable HTTP to any url
+		t := str(m, "transport")
+		if t == "" {
+			t = str(m, "type")
+		}
+		if u := str(m, "url"); u != "" && (t != "stdio" || str(m, "command") == "") {
+			tr := "http"
+			if t == "sse" {
+				tr = "sse"
+			}
+			remote(tr, u, m["headers"])
+		} else {
+			local(str(m, "command"), m["args"], m["env"])
+		}
+	case fmtPi, fmtPiNative:
+		// an entry moved from mcp-adapter.json keeps its httpTransport, so
+		// an SSE server still reads as one, which Pi's own can't reach
+		if u := str(m, "url"); u != "" {
+			t := "http"
+			if str(m, "type") == "sse" || str(m, "transport") == "sse" || str(m, "httpTransport") == "sse" {
+				t = "sse"
+			}
+			remote(t, u, m["headers"])
+		} else {
+			local(str(m, "command"), m["args"], m["env"])
+		}
+	default: // Claude Code, Cursor, Copilot, Crush, ZCode, omp, Grok
 		t := str(m, "type")
 		if u := str(m, "url"); u != "" {
 			if t != "sse" {
@@ -455,9 +725,9 @@ func (f *mcpFile) entries() (map[string]map[string]any, error) {
 	}
 	var doc map[string]any
 	switch f.Format {
-	case fmtCodex:
+	case fmtCodex, fmtGrok:
 		err = toml.Unmarshal(raw, &doc)
-	case fmtGoose:
+	case fmtGoose, fmtHermes:
 		err = yaml.Unmarshal(raw, &doc)
 	default:
 		err = json.Unmarshal(jsonc.ToJSON(raw), &doc)
@@ -487,8 +757,9 @@ func (f *mcpFile) read() (map[string]*Server, error) {
 			out[name] = s
 		}
 	}
-	if f.Format == fmtPi && err == nil {
-		// Pi's other files, the one magpie writes first winning a name
+	if (f.Format == fmtPi || f.Format == fmtPiNative || f.Format == fmtDesktop) && err == nil {
+		// Pi's (or Desktop's) other files, the one magpie writes first
+		// winning a name
 		for _, p := range append(slices.Clone(f.Also), f.Extra...) {
 			more, _ := (&mcpFile{Path: p, Format: f.Format}).read()
 			for name, s := range more {
@@ -503,7 +774,7 @@ func (f *mcpFile) read() (map[string]*Server, error) {
 
 // also is the file of each of Also, for formats written file by file.
 func (f *mcpFile) also() []*mcpFile {
-	if f.Format != fmtPi {
+	if f.Format != fmtPi && f.Format != fmtDesktop {
 		return nil
 	}
 	var out []*mcpFile
@@ -528,6 +799,16 @@ func (f *mcpFile) has(s *Server) bool {
 	return true
 }
 
+// holds says whether any file of Also has an entry by that name.
+func (f *mcpFile) holds(name string) bool {
+	for _, a := range f.also() {
+		if es, err := a.entries(); err == nil && es[name] != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // owned are the keys of an entry that say what the server is: magpie
 // writes them. An entry's other keys — a timeout, the tools it may call,
 // a note — are the user's, and kept when magpie writes the server again.
@@ -542,8 +823,24 @@ var owned = map[mcpFormat][]string{
 	fmtCodex:    {"url", "http_headers", "command", "args", "env"},
 	fmtDesktop:  {"url", "headers", "command", "args", "env"},
 	fmtPi:       {"transport", "httpTransport", "url", "headers", "command", "args", "env"},
+	// the adapter's transport keys too, dropped when magpie writes the
+	// entry again
+	fmtPiNative: {"type", "transport", "httpTransport", "url", "headers", "command", "args", "env"},
 	fmtZCode:    {"type", "url", "headers", "command", "args", "env"},
 	fmtDsh:      {"serverName", "transport", "url", "headers", "command", "args", "env"},
+	// timeout, enabled, tools, sampling, auth… are the user's
+	fmtHermes: {"transport", "url", "headers", "command", "args", "env"},
+	fmtOmp:    {"type", "url", "headers", "command", "args", "env"},
+	fmtKimi:   {"transport", "type", "url", "headers", "command", "args", "env"},
+	fmtDevin:  {"transport", "type", "url", "headers", "command", "args", "env"},
+	// enabled and the timeouts are the user's
+	fmtGrok: {"type", "url", "headers", "command", "args", "env"},
+	// the flat shape's keys go when magpie writes the entry again
+	fmtCline:       {"transport", "type", "transportType", "url", "headers", "command", "args", "cwd", "env"},
+	fmtCommandCode: {"transport", "type", "url", "headers", "command", "args", "env"},
+
+	// a url agy read in place of serverUrl goes when magpie writes one
+	fmtAntigravity: {"type", "serverUrl", "url", "headers", "command", "args", "env"},
 }
 
 // merged is the entry magpie writes, with what the user added to the old
@@ -552,8 +849,9 @@ var owned = map[mcpFormat][]string{
 func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 	o := f.encode(s)
 	mine := owned[f.Format]
+	behind := f.behind(s, old)
 	for i, e := range o {
-		if v, ok := old[e.k]; ok && !slices.Contains(mine, e.k) {
+		if v, ok := old[e.k]; ok && !slices.Contains(mine, e.k) && !(behind && f.Format == fmtGoose && e.k == "timeout") {
 			o[i].v = v
 		}
 	}
@@ -571,7 +869,7 @@ func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 func (f *mcpFile) put(s *Server, old map[string]any) error {
 	o := f.merged(s, old)
 	switch f.Format {
-	case fmtCodex:
+	case fmtCodex, fmtGrok:
 		return putCodex(f.Path, s.Name, o)
 	case fmtGoose:
 		m := map[string]any{}
@@ -579,6 +877,9 @@ func (f *mcpFile) put(s *Server, old map[string]any) error {
 			m[e.k] = e.v
 		}
 		return edit.SetYAML(f.Path, edit.KV{Path: "extensions." + s.Name, Value: m})
+	case fmtHermes:
+		// in its order, beside the user's other settings and comments
+		return edit.SetYAML(f.Path, edit.KV{Path: f.key() + "." + s.Name, Value: o})
 	case fmtDsh:
 		for _, p := range f.files() {
 			if err := dshPut(p, s.Name, o); err != nil {
@@ -587,16 +888,19 @@ func (f *mcpFile) put(s *Server, old map[string]any) error {
 		}
 		return nil
 	}
-	for _, a := range f.also() {
-		es, err := a.entries()
-		if err != nil {
-			return err
+	// Pi's files, or Desktop's, all of them or none
+	return edit.Atomically(func() error {
+		for _, a := range f.also() {
+			es, err := a.entries()
+			if err != nil {
+				return err
+			}
+			if err := a.put(s, es[s.Name]); err != nil {
+				return err
+			}
 		}
-		if err := a.put(s, es[s.Name]); err != nil {
-			return err
-		}
-	}
-	return edit.SetJSON(f.Path, edit.KV{Path: f.key() + "." + s.Name, Value: o})
+		return edit.SetJSON(f.Path, edit.KV{Path: f.key() + "." + s.Name, Value: o})
+	}, f.files()...)
 }
 
 // del takes the server by that name out of the file.
@@ -609,17 +913,21 @@ func (f *mcpFile) del(name string) error {
 			}
 		}
 		return nil
-	case fmtCodex:
+	case fmtCodex, fmtGrok:
 		return delCodex(f.Path, name, true)
 	case fmtGoose:
 		return edit.DelYAML(f.Path, "extensions."+name)
+	case fmtHermes:
+		return edit.DelYAML(f.Path, f.key()+"."+name)
 	}
-	for _, a := range f.also() {
-		if err := a.del(name); err != nil {
-			return err
+	return edit.Atomically(func() error {
+		for _, a := range f.also() {
+			if err := a.del(name); err != nil {
+				return err
+			}
 		}
-	}
-	return edit.DelJSON(f.Path, f.key()+"."+name)
+		return edit.DelJSON(f.Path, f.key()+"."+name)
+	}, f.files()...)
 }
 
 // ---- Codex's TOML ---------------------------------------------------------
@@ -628,26 +936,31 @@ func (f *mcpFile) del(name string) error {
 // or only those under it, which putCodex writes inline instead.
 // Include child array tables (such as env_vars), which would otherwise
 // implicitly recreate the removed server.
+// Each is one edit of the file: a step that fails puts it back as it was.
 func delCodex(path, name string, self bool) error {
-	table := "mcp_servers." + name
-	if err := edit.SetTOMLTables(path, []string{table + "."}, nil); err != nil {
-		return err
-	}
-	if !self {
-		return nil
-	}
-	return edit.DelTOMLTable(path, table)
+	return edit.Atomically(func() error {
+		table := "mcp_servers." + name
+		if err := edit.SetTOMLTables(path, []string{table + "."}, nil); err != nil {
+			return err
+		}
+		if !self {
+			return nil
+		}
+		return edit.DelTOMLTable(path, table)
+	}, path)
 }
 
 func putCodex(path, name string, o ordered) error {
-	if err := delCodex(path, name, false); err != nil {
-		return err
-	}
-	var kvs []edit.KV
-	for _, e := range o {
-		kvs = append(kvs, edit.KV{Path: tomlKey(e.k), Value: edit.Raw(tomlValue(e.v))})
-	}
-	return edit.SetTOMLTable(path, "mcp_servers."+name, kvs...)
+	return edit.Atomically(func() error {
+		if err := delCodex(path, name, false); err != nil {
+			return err
+		}
+		var kvs []edit.KV
+		for _, e := range o {
+			kvs = append(kvs, edit.KV{Path: tomlKey(e.k), Value: edit.Raw(tomlValue(e.v))})
+		}
+		return edit.SetTOMLTable(path, "mcp_servers."+name, kvs...)
+	}, path)
 }
 
 func tomlString(s string) string {

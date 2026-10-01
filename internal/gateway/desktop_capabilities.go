@@ -45,13 +45,23 @@ func desktopThinkingControl(p provider.Provider, model string) (string, bool) {
 	if control, known := catalog.ThinkingOf(sources, model); known {
 		return control, true
 	}
+	// A live or subscription catalog also names plain models that models.dev
+	// doesn't know. Manually entered references remain unknown.
+	for _, m := range p.Available() {
+		if m.ID == model {
+			if m.Reasoning {
+				return "reasoning", true
+			}
+			return "", true
+		}
+	}
 	return "", false
 }
 
-// desktopHaikuEfforts uses the entry's kept levels, but never advertises effort
+// desktopEfforts uses the entry's kept levels, but never advertises effort
 // for a manual-budget Claude even when a reseller labels it with levels.
 // A private reference can use levels known to its provider or set by the user.
-func desktopHaikuEfforts(e provider.Entry) []string {
+func desktopEfforts(e provider.Entry) []string {
 	if len(e.Efforts) == 0 {
 		return nil
 	}
@@ -65,10 +75,10 @@ func desktopHaikuEfforts(e provider.Entry) []string {
 	return e.Efforts
 }
 
-// desktopHaikuThinking fits even a stale session alias to the current member.
+// desktopModelThinking fits even a stale session alias to the current member.
 // It runs before protocol translation, so a group retry and a Chat/Responses
 // backend see the current model's controls rather than the alias's defaults.
-func desktopHaikuThinking(body []byte, p provider.Provider, model string) []byte {
+func desktopModelThinking(body []byte, p provider.Provider, model string) []byte {
 	control, known := desktopThinkingControl(p, model)
 	if !known {
 		return body
@@ -89,7 +99,7 @@ func desktopHaikuThinking(body []byte, p provider.Provider, model string) []byte
 		body = withBodyEffort(provider.Anthropic, body, e)
 	}
 	fields := map[string]any{}
-	if control == "" || control == "budget_tokens" || control == "toggle" {
+	if control == "" || control == "budget_tokens" || control == "toggle" || control == "reasoning" {
 		delete(v.OutputConfig, "effort")
 		if len(v.OutputConfig) > 0 {
 			fields["output_config"] = v.OutputConfig
@@ -101,15 +111,7 @@ func desktopHaikuThinking(body []byte, p provider.Provider, model string) []byte
 	case control == "":
 		body = withoutFields(body, "thinking")
 	case v.Thinking.Type == "disabled" && control == "adaptive":
-		lower := strings.ToLower(model)
-		if strings.Contains(lower, "claude-fable-") || strings.Contains(lower, "claude-mythos-") || strings.Contains(lower, "claude-opus-5-5") {
-			body = withoutFields(body, "thinking") // these models always think; disabled is rejected
-		} else if strings.Contains(lower, "claude-sonnet-5-5") {
-			fields["thinking"] = map[string]any{"type": "between_tools"}
-			if e := bodyEffort(provider.Anthropic, body); e == "xhigh" || e == "max" {
-				body = withBodyEffort(provider.Anthropic, body, "high")
-			}
-		}
+		body = withoutFields(body, "thinking") // let the adaptive model use its own default
 	case v.Thinking.Type == "enabled" || v.Thinking.Type == "adaptive":
 		switch control {
 		case "adaptive":

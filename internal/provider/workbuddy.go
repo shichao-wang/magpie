@@ -37,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -157,6 +158,9 @@ type wbAccount struct {
 	site  *wbSite
 	creds wbCreds
 	own   bool
+	// via, for an account on the plugin, sends a request as the plugin
+	// does, signed with its sign-in, which magpie never renews itself
+	via func(*http.Request) (*http.Response, error)
 }
 
 // ---- WorkBuddy's own account --------------------------------------------------
@@ -296,7 +300,7 @@ func setWorkBuddyLoginOn(w *wbSite, user string, on bool) error {
 }
 
 func forgetWorkBuddyLogin(w *wbSite, user string) error {
-	return forgetSideLogin(w.id, user, w.name+"'s own sign-in; sign out in "+w.name, wbSide(w), nil)
+	return forgetSideLogin(w.id, user, wbSide(w), nil)
 }
 
 func workBuddyAccount(w *wbSite) (Provider, bool) {
@@ -341,6 +345,7 @@ func wbProvider(a wbAccount) Provider {
 		}
 		return nil
 	}
+	acct.explain = wbExplain
 	acct.models = func() []catalog.Model { return w.models }
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
 		ms, err := wbFetchModels(ctx, w, acct.sign)
@@ -410,6 +415,24 @@ func wbClientHeaders(req *http.Request) {
 	id = wbRequestID()
 	req.Header.Set("X-Conversation-Message-ID", id)
 	req.Header.Set("X-Request-ID", id)
+}
+
+// WBRefusedHint is what the user can do about WorkBuddy's "Illegal API
+// invocation from an unapproved channel": both builds (the CodeBuddy plan)
+// answer it to a chat whose system prompt is Codex's or Claude Code's own
+// (#182), whatever the headers. magpie never rewrites that prompt; the
+// agent is told to use WorkBuddy from another agent instead.
+const WBRefusedHint = "WorkBuddy refuses chats from Codex and Claude Code (their system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
+
+// wbRefused matches that refusal in what WorkBuddy answered.
+var wbRefused = regexp.MustCompile(`(?i)unapproved channel|illegal api invocation`)
+
+// wbExplain adds WBRefusedHint to WorkBuddy's refusal of the client.
+func wbExplain(status int, body []byte) string {
+	if status >= 400 && wbRefused.Match(body) {
+		return WBRefusedHint
+	}
+	return ""
 }
 
 // wbRequestID is a new id as WorkBuddy makes them: 32 hex digits.
@@ -669,6 +692,10 @@ const (
 // {code, msg, data}: code 0 is a success. On a non-zero code it returns a
 // *wbError carrying it.
 func wbCall(ctx context.Context, method, u string, headers map[string]string, body, dst any) error {
+	return wbCallVia(ctx, http.DefaultClient.Do, method, u, headers, body, dst)
+}
+
+func wbCallVia(ctx context.Context, do func(*http.Request) (*http.Response, error), method, u string, headers map[string]string, body, dst any) error {
 	var rd io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -684,7 +711,7 @@ func wbCall(ctx context.Context, method, u string, headers map[string]string, bo
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := do(req)
 	if err != nil {
 		return err
 	}

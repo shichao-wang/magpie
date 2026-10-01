@@ -26,33 +26,13 @@ type loginUsageEntry struct {
 // user. What was fetched less than a minute ago comes from the cache; the
 // rest is asked for at once, as long as ctx allows.
 func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota {
-	if agent == "grok" {
-		return grokLoginUsage(ctx)
-	}
 	out := map[string]SubscriptionQuota{}
 	var logins []Login
-	switch agent {
-	case "claude", "codex":
-		logins = Logins(agent)
-	case "copilot":
-		logins = copilotLoginList()
-	case "zcode":
-		logins = zcodeLoginList()
-	case "kiro":
-		logins = kiroLoginList()
-	case "workbuddy", WorkBuddyAIID:
-		logins = wbLoginList(wbSiteOf(agent))
-	case CommandCodePlanID:
-		logins = cmdLoginList()
-	case "qoder":
-		logins = loginsOf(qoderLogins())
-	case "gemini", "antigravity":
-		logins = googleLoginList(agent)
-	case "cursor": // one account, the one cursor-agent is signed in to
-		if user, plan, ok := cursorIdentity(); ok {
-			logins = []Login{{Agent: agent, User: user, Plan: plan, Active: true, On: true}}
-		}
-	default:
+	if pp, ok := pluginOfAgent(agent); ok {
+		logins = pluginUsageLogins(pp)
+	} else if agent == "grok" {
+		return grokLoginUsage(ctx)
+	} else if logins, ok = builtinLogins(agent); !ok {
 		return out
 	}
 	c := &loginUsageCache
@@ -92,9 +72,73 @@ func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota 
 	return out
 }
 
+// builtinLogins are the accounts of a built-in subscription whose
+// allowance can be asked; false for an agent that tells none.
+func builtinLogins(agent string) (logins []Login, ok bool) {
+	switch agent {
+	case "claude", "codex":
+		logins = Logins(agent)
+	case "copilot":
+		logins = copilotLoginList()
+	case "zcode":
+		logins = zcodeLoginList()
+	case "kiro":
+		logins = kiroLoginList()
+	case "workbuddy", WorkBuddyAIID:
+		logins = wbLoginList(wbSiteOf(agent))
+	case CommandCodePlanID:
+		logins = cmdLoginList()
+	case "qoder", QoderCNID:
+		logins = loginsOf(qoderLoginsOf(agent))
+	case "zed":
+		logins = zedLoginList()
+	case "devin":
+		logins = devinLoginList()
+	case "factory":
+		logins = factoryLoginList()
+	case MiMoID:
+		logins = mimoLoginList()
+	case "gemini", "antigravity":
+		logins = googleLoginList(agent)
+	case "cursor": // one account, the one cursor-agent is signed in to
+		if user, plan, ok := cursorIdentity(); ok {
+			logins = []Login{{Agent: agent, User: user, Plan: plan, Active: true, On: true}}
+		}
+	default:
+		return nil, false
+	}
+	return logins, true
+}
+
+// loginProvider is the id of the provider l signs in: a plugin's
+// ("plugin:grok") is its provider's, grok for a moved Grok, whose proxy
+// picks are kept under it.
+func loginProvider(l Login) string {
+	if id, ok := strings.CutPrefix(l.Agent, "plugin:"); ok {
+		return PluginID(id)
+	}
+	return l.Agent
+}
+
 func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
-	if l.Agent == "qoder" {
+	ctx = ViaLogin(ctx, loginProvider(l), l.User) // asked through the account's own proxy
+	if strings.HasPrefix(l.Agent, "plugin:") {
+		return pluginLoginQuota(ctx, l)
+	}
+	if l.Agent == "qoder" || l.Agent == QoderCNID {
 		return qoderLoginQuota(ctx, l)
+	}
+	if l.Agent == "zed" {
+		return zedLoginQuota(ctx, l)
+	}
+	if l.Agent == "devin" {
+		return devinLoginQuota(ctx, l)
+	}
+	if l.Agent == "factory" {
+		return factoryLoginQuota(ctx, l)
+	}
+	if l.Agent == MiMoID {
+		return mimoLoginQuota(ctx, l)
 	}
 	if l.Agent == "cursor" {
 		return cursorSubscriptionUsage(ctx, l.Plan)
@@ -123,11 +167,19 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 		return SubscriptionQuota{Provider: l.Agent, Plan: l.Plan, Windows: []QuotaWindow{}, Error: "not signed in"}
 	}
 	q := SubscriptionQuota{Provider: l.Agent, Plan: l.Plan, Windows: []QuotaWindow{}}
+	if l.Agent == "claude" && !l.Active {
+		// a saved account is never asked: what Claude Code told of it
+		ws, err := claudeWindows(ctx, l.User, false)
+		q.Windows = ws
+		if err != nil {
+			q.Error = err.Error()
+		}
+		return q
+	}
 	var tok, accountID string
 	var err error
 	switch {
-	case l.Active && l.Agent == "claude":
-		tok, err = claudeToken(ctx)
+	case l.Agent == "claude": // Claude Code reads its own (claudeWindows)
 	case l.Active:
 		tok, accountID, err = codexToken(ctx, codexAuthPath())
 	default:
@@ -135,7 +187,7 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	}
 	if err == nil {
 		if l.Agent == "claude" {
-			q.Windows, err = claudeWindows(ctx, l.User, tok)
+			q.Windows, err = claudeWindows(ctx, l.User, true)
 		} else {
 			var plan string
 			if plan, q.Windows, q.Resets, err = codexWindows(ctx, tok, accountID); plan != "" {

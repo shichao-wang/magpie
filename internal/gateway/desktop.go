@@ -50,9 +50,6 @@ func desktopAccepts(id string) bool {
 	return false
 }
 
-// These aliases were issued by earlier Desktop catalogs and still resolve for
-// existing sessions. New catalogs use the four tier ids in desktop_tiers.go.
-//
 // desktopAlias is the prefix of the id a model is listed by to Claude
 // Desktop when its own id names no Claude model: anthropic/magpie-<number>,
 // the number a hash of magpie's id, so it stays the model's while the
@@ -74,8 +71,8 @@ const desktopAlias = "anthropic/magpie-"
 // xhigh and max (high recommended, thinking always on), and IC the id
 // lowercased with a Bedrock-style "<profile>.anthropic." prefix and a date
 // taken off. No provider/model id is either, so no model magpie served had
-// the picker (ARNO). Earlier catalogs listed a model with reasoning levels
-// by one of these instead:
+// the picker (ARNO). A model with reasoning levels is listed by one of
+// these instead:
 //
 //   - a Claude model (claude-opus-4-8 at any provider):
 //     magpie-<number>.anthropic.claude-opus-4-8, which IC reads as
@@ -92,10 +89,74 @@ const (
 	desktopClaudeInfix = ".anthropic."
 )
 
+// desktopClaude is a model id that is Anthropic's own Claude model, as tIt
+// knows it: claude-<tier>-<version>, a date taken off.
+var (
+	desktopClaude = regexp.MustCompile(`^claude-(?:opus|sonnet|haiku|fable|mythos)-\d+(?:-\d+)?$`)
+	desktopDated  = regexp.MustCompile(`-\d{8}$`)
+)
+
 func aliasNumber(id string) string {
 	h := fnv.New64a()
 	h.Write([]byte(id))
 	return fmt.Sprintf("%010d", h.Sum64()%1e10)
+}
+
+func aliasFor(id string) string { return desktopAlias + aliasNumber(id) }
+
+// claudeModel is the Claude model an entry is, lowercased and without a
+// date or a vendor's "anthropic/" in front, or "" when it is none.
+func claudeModel(e provider.Entry) string {
+	m := strings.ToLower(e.Model)
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	m = desktopDated.ReplaceAllString(m, "")
+	if desktopClaude.MatchString(m) {
+		return m
+	}
+	return ""
+}
+
+// claudeLooking is a model's id as Claude Desktop is shown it: one that
+// gets its effort picker when the model has reasoning levels, else as it is
+// when it already reads as a Claude model's, else its alias (unprefixed
+// serves each again).
+func claudeLooking(e provider.Entry) string {
+	if len(e.Efforts) > 0 {
+		if m := claudeModel(e); m != "" {
+			return "magpie-" + aliasNumber(e.ID) + desktopClaudeInfix + m
+		}
+		return desktopEffortAlias + aliasNumber(e.ID)
+	}
+	if desktopAccepts(e.ID) && !strings.HasPrefix(e.ID, desktopAlias) {
+		return e.ID
+	}
+	return aliasFor(e.ID)
+}
+
+// desktopModels is /v1/models as Claude Desktop is shown it: every model by
+// an id it keeps (claudeLooking), named so the picker tells them apart —
+// it shows the name, not the id, and folds rows of one name into one entry.
+func desktopModels(entries []provider.Entry) []map[string]any {
+	names := map[string]int{}
+	for _, e := range entries {
+		names[desktopName(e)]++
+	}
+	data := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		m := modelObject(e)
+		name := desktopName(e)
+		if names[name] > 1 && name != e.ID {
+			name += " (" + e.ID + ")"
+		}
+		m["display_name"] = name
+		if m["id"] = claudeLooking(e); m["id"] != e.ID {
+			m["description"] = e.ID + " in magpie"
+		}
+		data = append(data, m)
+	}
+	return data
 }
 
 func desktopName(e provider.Entry) string {
@@ -152,8 +213,9 @@ func isClaudeDesktop(r *http.Request) bool {
 //
 // Desktop's four tier ids and historical tier requests use their own
 // configuration, or the first visible catalog model when unconfigured.
-// For older sessions using other ids, turns carrying tools remember the
-// selected model as a fallback for unserved or small tool-less requests.
+// Catalog selections, including older sessions using hashed aliases, retain
+// their model. Turns carrying tools remember the selection as a fallback for
+// unserved or small tool-less requests.
 // It is kept on disk so these auxiliary requests can still resolve before
 // the first full turn after a restart; before any selection, they use
 // desktopDefault.

@@ -1,5 +1,10 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
-// Saving the current setup as a profile in the tray panel's Profiles tab:
+// The tray panel's profiles open from Profiles at the Agents tab's foot, on
+// its left, over the list and upward from it (the user: tray window 中方案不
+// 应该有一个单独的 tab，在 Agents tab 左下角有个方案即可): no Profiles tab; the
+// button shows how many there are, only on the Agents tab; a click outside,
+// Escape, another tab or a profile applied closes them.
+// Saving the current setup as a profile there:
 // "＋ Save current", with the list scrolled to its end, opens a name field
 // beside it without moving the list (the field at the list's head drew it
 // up under the tabs, the field's top cut off) and with one ring, not the
@@ -49,6 +54,7 @@ function server(lang, saved, { count = 30, delay = 0, refuse = "" } = {}) {
       profiles = profiles.filter((p) => p.name !== name);
       return route.fulfill({ json: state() });
     }
+    if (url.pathname === "/api/profile/use") return route.fulfill({ json: { ...state(), changed: 1 } });
     if (url.pathname === "/api/usage/quotas") return route.fulfill({ json: [] });
     if (url.pathname === "/api/groups") return route.fulfill({ json: { groups: [] } });
     if (url.pathname === "/api/providers") return route.fulfill({ json: { providers: [], gateway: { running: true } } });
@@ -80,12 +86,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, saved, opts));
       await page.goto("http://magpie.test/?mode=panel");
-      await page.locator("#profiles .chip, #profiles .hint").first().waitFor({ state: "attached" }); // shown with the tab
-      await page.locator('[data-ptab="profiles"]').click();
-      await page.waitForTimeout(300);
+      await page.locator("#profiles .chip, #profiles .hint").first().waitFor({ state: "attached" });
+      assert.equal(await page.locator('[data-ptab="profiles"]').count(), 0, "no Profiles tab");
+      await page.locator("#profBtn").click();
+      await page.locator(".profiles.open").waitFor();
+      await page.waitForTimeout(450);
       return page;
     };
-    const view = (page) => page.locator("#view-agents").evaluate((v) => v.scrollTop);
+    const view = (page) => page.locator(".profiles").evaluate((v) => v.scrollTop);
 
     for (const [lang, add, save] of [["en", "＋ Save current", "Save"], ["zh", "＋ 保存当前", "保存"]]) {
       await t.test(lang, async () => {
@@ -94,9 +102,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const button = page.locator("#save");
         assert.equal((await button.textContent()).trim(), add);
 
+        // over the list, upward from the button at its foot's left, the list
+        // left where it was
+        const pos = await page.evaluate(() => {
+          const p = document.querySelector(".profiles").getBoundingClientRect(), b = document.querySelector("#profBtn").getBoundingClientRect();
+          const f = document.querySelector(".foot").getBoundingClientRect(), tabs = document.querySelector("#ptabs").getBoundingClientRect();
+          return { above: p.bottom <= b.top, near: b.top - p.bottom < 12, left: Math.abs(p.left - b.left) < 16 && b.left - f.left < 20, under: p.top >= tabs.bottom, count: document.querySelector("#profBtn").textContent, agents: getComputedStyle(document.querySelector("#agents")).display };
+        });
+        assert(pos.above && pos.near && pos.left && pos.under, JSON.stringify(pos));
+        assert.match(pos.count, new RegExp(`${lang === "zh" ? "方案" : "Profiles"}\\s*30`));
+        assert.notEqual(pos.agents, "none", "the agents stay under them");
         // the reader scrolls to the button; the field opens beside it, whole,
         // with one ring, and nothing moves
-        const box = await page.locator("#view-agents").boundingBox();
+        const box = await page.locator(".profiles").boundingBox();
         await page.mouse.move(box.x + box.width / 2, box.y + 60);
         for (let i = 0; i < 20; i++) { await page.mouse.wheel(0, 40); await page.waitForTimeout(20); }
         await page.waitForTimeout(400);
@@ -108,7 +126,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForTimeout(300);
         assert.equal(await view(page), before, "opening the field must not scroll the list");
         const cut = await page.evaluate(() => {
-          const v = document.querySelector("#view-agents").getBoundingClientRect(), f = document.querySelector(".profiles > .chip-input");
+          const v = document.querySelector(".profiles").getBoundingClientRect(), f = document.querySelector(".profiles > .chip-input");
           const inView = (e) => { const r = e.getBoundingClientRect(); return r.top >= v.top + 1 && r.bottom <= v.bottom; };
           return { field: inView(f), button: inView(document.querySelector("#save")), outline: getComputedStyle(f).outlineStyle, focused: document.activeElement === f };
         });
@@ -145,6 +163,27 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await field.press("Escape");
         assert.equal(await field.count(), 0);
         assert.equal((await button.textContent()).trim(), add);
+        assert(await page.locator(".profiles.open").isVisible(), "Escape in the field closes the field alone");
+
+        // Escape closes them, the button opens them again, a click outside
+        // closes them, and so does another tab (where the button isn't)
+        await page.keyboard.press("Escape");
+        assert.equal(await page.locator(".profiles.open").count(), 0);
+        await page.locator("#profBtn").click();
+        await page.locator(".profiles.open").waitFor();
+        await page.mouse.click(420, 150);
+        assert.equal(await page.locator(".profiles.open").count(), 0);
+        await page.locator("#profBtn").click();
+        await page.locator('[data-ptab="routing"]').click();
+        assert.equal(await page.locator(".profiles.open").count(), 0);
+        assert(!(await page.locator("#profBtn").isVisible()), "Profiles is the Agents tab's");
+        await page.locator('[data-ptab="agents"]').click();
+        assert(await page.locator("#profBtn").isVisible());
+
+        // a profile applied closes them, the agents in sight
+        await page.locator("#profBtn").click();
+        await page.locator('#profiles .chip:has-text("profile-1")').first().click();
+        await page.waitForFunction(() => !document.querySelector(".profiles.open"));
       });
 
       await t.test(lang + ": a slow magpie, from none", async () => {
@@ -153,7 +192,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const button = page.locator("#save"), field = page.locator(".profiles > .chip-input");
         const chip = (name) => page.locator("#profiles .chip", { hasText: name });
         const where = () => page.evaluate(() => {
-          const v = document.querySelector("#view-agents"), tabs = document.querySelector("#ptabs").getBoundingClientRect();
+          const v = document.querySelector(".profiles"), tabs = document.querySelector("#ptabs").getBoundingClientRect();
           const c = document.querySelector("#profiles .chip");
           return { scroll: v.scrollTop, below: !c || c.getBoundingClientRect().top >= tabs.bottom, status: document.querySelector("#status").textContent };
         });

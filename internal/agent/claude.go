@@ -3,8 +3,12 @@ package agent
 import (
 	"cmp"
 	"fmt"
+	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,21 +35,116 @@ var claudeEnv = []string{
 // A tier that has none follows the main model.
 var claudeTiers = []string{"opus", "sonnet", "haiku", "fable"}
 
-// claudeEfforts are the levels Claude Code starts with: settings.json's
-// effortLevel takes the first four, max is claudeEffortEnv.
+// claudeEfforts are the levels Claude Code starts with: settings.json
+// keeps the first four, max is claudeEffortEnv.
 var claudeEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 
 // claudeEffortEnv is the effort every Claude Code session asks for, max
-// among them.
+// among them. It outranks /effort, so only max, which settings.json can't
+// keep, is written there.
 const claudeEffortEnv = "CLAUDE_CODE_EFFORT_LEVEL"
+
+// claudeNameRe finds the Claude model an id names, as Claude Code matches it
+// to its settings: claude-opus-5-5 in claude-opus-5-5[1m], in a dated id or
+// under a provider's prefix (anthropic/…).
+var claudeNameRe = regexp.MustCompile(`claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2}))?(?:[^0-9]|$)`)
+
+// claudeName is the Claude model a model id names, "" for another vendor's,
+// an alias (opus) or none.
+func claudeName(model string) string {
+	m := claudeNameRe.FindStringSubmatch(strings.ToLower(model))
+	if m == nil {
+		return ""
+	}
+	name := "claude-" + m[1] + "-" + m[2]
+	if m[3] != "" {
+		name += "-" + m[3]
+	}
+	return name
+}
+
+// claudeEffortsFor is the levels Claude Code sends a model at, as 2.1.285
+// sends them: Opus 4.5 takes up to high, Opus and Sonnet 4.6 skip xhigh, the
+// Haiku and older Claude models none; any higher level runs as the highest
+// below it. A model it doesn't know (another vendor's through magpie, a Claude
+// newer than it) gets the level as set.
+func claudeEffortsFor(model string) []string {
+	switch claudeName(model) {
+	case "claude-opus-4-5":
+		return []string{"low", "medium", "high"}
+	case "claude-opus-4-6", "claude-sonnet-4-6":
+		return []string{"low", "medium", "high", "max"}
+	case "claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4", "claude-sonnet-4":
+		return nil
+	case "":
+		if strings.Contains(strings.ToLower(model), "claude-3") {
+			return nil
+		}
+	}
+	return claudeEfforts
+}
+
+// claudeTopEffort is the models the effortLevel at the top of the user's
+// settings.json applies to: Opus 5, Fable 5.1 and those before them. Opus
+// 5.5 and every Claude model after it (any Claude Code doesn't know) read
+// only modelSettings.<model>.effortLevel (2.1.251 on); another vendor's
+// reads the top one.
+var claudeTopEffort = []string{
+	"claude-opus-4", "claude-sonnet-4", "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5",
+	"claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-7", "claude-opus-4-8",
+	"claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-fable-5-1",
+}
+
+func claudeReadsTop(model string) bool {
+	n := claudeName(model)
+	return n == "" || contains(claudeTopEffort, n)
+}
+
+// claudeClamp is the level Claude Code runs a model at when set to v: the
+// highest the model takes at or below it, "" when it takes none.
+func claudeClamp(v string, levels []string) string {
+	if v == "" || len(levels) == 0 || contains(levels, v) {
+		if len(levels) == 0 {
+			return ""
+		}
+		return v
+	}
+	at := slices.Index(claudeEfforts, v)
+	if at < 0 {
+		return v
+	}
+	out := levels[0]
+	for _, l := range levels {
+		if slices.Index(claudeEfforts, l) <= at {
+			out = l
+		}
+	}
+	return out
+}
+
+// claudeAliases are the names Claude Code takes for a model besides ids.
+var claudeAliases = []string{"default", "best", "opus", "sonnet", "haiku", "fable", "opusplan"}
+
+// claudeContextEnv is the context window Claude Code takes a model it
+// doesn't know for (any but Claude's own names); without it, 200K. Its
+// auto-compact window (CLAUDE_CODE_AUTO_COMPACT_WINDOW, the autoCompactWindow
+// setting) is only ever the smaller of its own value and this one, so this
+// is what tells it where a 128K or a 400K model runs out. A name marked [1m]
+// is 1M whatever it says.
+const claudeContextEnv = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 
 func tierEnv(tier string) string { return "ANTHROPIC_DEFAULT_" + strings.ToUpper(tier) + "_MODEL" }
 
-func claude(home string) *Agent {
-	path := filepath.Join(home, ".claude", "settings.json")
+func claude(home string) *Agent { return claudeIn(here(home)) }
+
+// claudeIn is Claude Code as it lives at a place: this machine's home, or
+// a WSL distro's (see wsl.go), its settings.json naming the gateway as it
+// reaches it from there.
+func claudeIn(at place) *Agent {
+	path := filepath.Join(at.home, ".claude", "settings.json")
 	env := func(k string) string { v, _ := edit.GetJSON(path, "env."+k); return v }
 	model := jsonGet(path, "model")
-	routed := func() bool { return env("ANTHROPIC_BASE_URL") == gateway.URL() }
+	routed := func() bool { return env("ANTHROPIC_BASE_URL") == at.gw() }
 
 	// the value shown: the catalog ref while routed, else Claude's own model.
 	get := func() string {
@@ -56,6 +155,23 @@ func claude(home string) *Agent {
 		}
 		return model()
 	}
+	// the context window magpie last wrote, so a value the user wrote is
+	// never taken for magpie's: that one is left as it is
+	windowKey := at.key("claude.context_tokens")
+	windowOurs := func() bool {
+		cur := env(claudeContextEnv)
+		return cur != "" && cur == stashLoad()[windowKey]
+	}
+	dropWindow := func() error {
+		defer forget(windowKey)
+		if windowOurs() {
+			return edit.DelJSON(path, "env."+claudeContextEnv)
+		}
+		return nil
+	}
+	// what was last written that an open Claude Code session doesn't see:
+	// it reads settings.json at start-up, only its env as it goes
+	stale := ""
 	var writeTiers func(main string, tiers map[string]string) error
 	set := func(v string) error {
 		if v == "" {
@@ -64,15 +180,18 @@ func claude(home string) *Agent {
 			for _, k := range claudeEnv {
 				keys = append(keys, "env."+k)
 			}
-			forget("claude.model", "claude.base_url", "claude.auth_token")
+			forget(at.key("claude.model"), at.key("claude.base_url"), at.key("claude.auth_token"))
+			if err := dropWindow(); err != nil {
+				return err
+			}
 			return edit.DelJSON(path, keys...)
 		}
 		if isMagpie(v) {
 			if !routed() {
 				stash(map[string]string{
-					"claude.model":      model(),
-					"claude.base_url":   env("ANTHROPIC_BASE_URL"),
-					"claude.auth_token": env("ANTHROPIC_AUTH_TOKEN"),
+					at.key("claude.model"):      model(),
+					at.key("claude.base_url"):   env("ANTHROPIC_BASE_URL"),
+					at.key("claude.auth_token"): env("ANTHROPIC_AUTH_TOKEN"),
 				})
 			}
 			// tiers that followed the old model follow the new one; the
@@ -86,6 +205,17 @@ func claude(home string) *Agent {
 			}
 			return writeTiers(v, tiers)
 		}
+		// a word that is no model: an effort level the model doesn't take,
+		// ultracode (magpie claude ultra), a typo. Another endpoint's
+		// names are its own.
+		if u := env("ANTHROPIC_BASE_URL"); u == "" || routed() {
+			if err := claudeModelWord(v, get()); err != nil {
+				return err
+			}
+		}
+		if err := dropWindow(); err != nil {
+			return err
+		}
 		if routed() {
 			keys := make([]string, len(claudeEnv))
 			for i, k := range claudeEnv {
@@ -94,12 +224,12 @@ func claude(home string) *Agent {
 			if err := edit.DelJSON(path, keys...); err != nil {
 				return err
 			}
-			unstash("claude.model")
+			unstash(at.key("claude.model"))
 			var back []edit.KV
-			if u := unstash("claude.base_url"); u != "" {
+			if u := unstash(at.key("claude.base_url")); u != "" {
 				back = append(back, edit.KV{Path: "env.ANTHROPIC_BASE_URL", Value: u})
 			}
-			if t := unstash("claude.auth_token"); t != "" {
+			if t := unstash(at.key("claude.auth_token")); t != "" {
 				back = append(back, edit.KV{Path: "env.ANTHROPIC_AUTH_TOKEN", Value: t})
 			}
 			if len(back) > 0 {
@@ -114,8 +244,15 @@ func claude(home string) *Agent {
 	// writeTiers routes Claude Code through the gateway with main as its
 	// model and each tier on the model given.
 	writeTiers = func(main string, tiers map[string]string) error {
+		// a 1M model goes in marked [1m] however it was named, or Claude
+		// Code takes it for 200K
+		mark := claude1M()
+		main = mark(main)
+		for t, v := range tiers {
+			tiers[t] = mark(v)
+		}
 		kvs := []edit.KV{
-			{Path: "env.ANTHROPIC_BASE_URL", Value: gateway.URL()},
+			{Path: "env.ANTHROPIC_BASE_URL", Value: at.gw()},
 			{Path: "env.ANTHROPIC_AUTH_TOKEN", Value: gateway.Token},
 			{Path: "env.ANTHROPIC_MODEL", Value: main},
 			{Path: "env.ANTHROPIC_SMALL_FAST_MODEL", Value: tiers["haiku"]},
@@ -134,6 +271,18 @@ func claude(home string) *Agent {
 		} else {
 			kvs = append(kvs, edit.KV{Path: "env.CLAUDE_CODE_SUBAGENT_MODEL", Value: main})
 		}
+		// the new model's window replaces the old one's, when magpie knows
+		// it; one the user set is theirs
+		if env(claudeContextEnv) == "" || windowOurs() {
+			if w := claudeWindow(main, tiers); w > 0 {
+				kvs = append(kvs, edit.KV{Path: "env." + claudeContextEnv, Value: strconv.Itoa(w)})
+				stash(map[string]string{windowKey: strconv.Itoa(w)})
+			} else if err := dropWindow(); err != nil {
+				return err
+			}
+		} else {
+			forget(windowKey)
+		}
 		return edit.SetJSON(path, kvs...)
 	}
 
@@ -142,44 +291,116 @@ func claude(home string) *Agent {
 		Get: get,
 		Set: set,
 		Options: func(map[string]string) []Option {
-			var own []Option
-			for _, m := range catalog.Provider("anthropic") {
-				if strings.HasPrefix(m.ID, "claude") {
-					own = append(own, Option{Value: m.ID, Note: m.Name, Icon: "claude-color"})
-				}
-			}
 			name := "Claude Code"
 			if u := env("ANTHROPIC_BASE_URL"); u != "" && !routed() {
 				name += " · " + hostOf(u)
 			}
-			// Only the catalog's models; Claude Code's own short aliases are
-			// not something any API lists, and a compiled-in copy would just
-			// go stale.
-			return append(group(name, own), claudeViaMagpie()...)
+			return append(group(name, claudeOwn()), claudeViaMagpie()...)
 		},
 	}, {
-		// the effort Claude Code starts with, as its /effort saves it;
-		// settings.json keeps low to xhigh (/effort max lasts a session
-		// only), so max is CLAUDE_CODE_EFFORT_LEVEL in its env, which every
-		// session starts with and asks for
+		// the effort Claude Code starts with, as its /effort saves it: under
+		// modelSettings for the model (Opus 5.5 and later read only that),
+		// and at the top for the models before them and other vendors'. max
+		// lasts a session there, so it is CLAUDE_CODE_EFFORT_LEVEL in its
+		// env, which every session starts with and asks for. Shown as the
+		// level the model runs at: Opus 4.5 set to max runs at high.
 		Key: "effort", Label: "effort",
-		Get: func() string { return cmp.Or(env(claudeEffortEnv), jsonGet(path, "effortLevel")()) },
+		Get: func() string {
+			m := get()
+			levels := claudeEffortsFor(m)
+			if e := env(claudeEffortEnv); e != "" {
+				return claudeClamp(e, levels)
+			}
+			if n := claudeName(m); n != "" {
+				if e, _ := edit.GetJSON(path, "modelSettings."+n+".effortLevel"); e != "" {
+					return claudeClamp(e, levels)
+				}
+			}
+			if claudeReadsTop(m) {
+				return claudeClamp(jsonGet(path, "effortLevel")(), levels)
+			}
+			return ""
+		},
 		Set: func(v string) error {
+			m := get()
 			if v != "" && !contains(claudeEfforts, v) {
+				if v == "ultra" || v == "ultracode" {
+					return fmt.Errorf("ultracode is a switch of Claude Code's beside its effort: magpie claude ultracode on")
+				}
 				return fmt.Errorf("Claude Code keeps an effort of %s, not %q", strings.Join(claudeEfforts, ", "), v)
 			}
+			if err := claudeTakes(m, v); err != nil {
+				return err
+			}
 			if v == "max" {
+				stale = ""
 				return edit.SetJSON(path, edit.KV{Path: "env." + claudeEffortEnv, Value: v})
 			}
+			// what an open session reads is its env: the level written below
+			// waits for the next one
+			stale = "effort"
 			if env(claudeEffortEnv) != "" {
 				if err := edit.DelJSON(path, "env."+claudeEffortEnv); err != nil {
 					return err
 				}
 			}
-			return jsonSet(path, "effortLevel")(v)
+			n := claudeName(m)
+			if v == "" {
+				// the model's own default, as /effort auto leaves it: its
+				// level goes, its other keys (maxEffortLevel) stay
+				if n != "" {
+					if err := claudeDropModelEffort(path, n); err != nil {
+						return err
+					}
+				}
+				if claudeReadsTop(m) {
+					return edit.DelJSON(path, "effortLevel")
+				}
+				return nil
+			}
+			var kvs []edit.KV
+			if claudeReadsTop(m) {
+				kvs = append(kvs, edit.KV{Path: "effortLevel", Value: v})
+			}
+			if n != "" {
+				kvs = append(kvs, edit.KV{Path: "modelSettings." + n + ".effortLevel", Value: v})
+			}
+			return edit.SetJSON(path, kvs...)
 		},
-		Options: func(map[string]string) []Option {
-			return static(claudeEfforts...)
+		Options: func(cur map[string]string) []Option {
+			return static(claudeEffortsFor(cur["model"])...)
+		},
+	}, {
+		// ultracode (2.1.284 on): Claude plans a workflow for each
+		// substantive task, at whatever effort. Only a model that takes
+		// xhigh has it.
+		Key: "ultracode", Label: "ultracode", Quiet: true,
+		// shown off for a model without it, which Claude Code runs so
+		Get: func() string {
+			if v, _ := edit.GetJSON(path, "ultracode"); v == "true" && contains(claudeEffortsFor(get()), "xhigh") {
+				return "on"
+			}
+			return ""
+		},
+		Set: func(v string) error {
+			switch v {
+			case "", "off":
+				stale = "ultracode"
+				return edit.DelJSON(path, "ultracode")
+			case "on":
+				if m := get(); !contains(claudeEffortsFor(m), "xhigh") {
+					return fmt.Errorf("Claude Code has ultracode only on a model that takes xhigh effort, and %s doesn't", orDefault(m))
+				}
+				stale = "ultracode"
+				return edit.SetJSON(path, edit.KV{Path: "ultracode", Value: true})
+			}
+			return fmt.Errorf("ultracode is on or off, not %q", v)
+		},
+		Options: func(cur map[string]string) []Option {
+			if !contains(claudeEffortsFor(cur["model"]), "xhigh") {
+				return nil
+			}
+			return []Option{{Value: "on", Note: "Claude plans a workflow for each substantive task"}}
 		},
 	}}
 	for _, tier := range claudeTiers {
@@ -235,17 +456,100 @@ func claude(home string) *Agent {
 				return ""
 			}
 			// an administrator's settings win over the user's
-			if u, _ := edit.GetJSON(claudeManaged(), "env.ANTHROPIC_BASE_URL"); u != "" && u != gateway.URL() {
-				return "Claude Code's managed settings (" + claudeManaged() + ") set ANTHROPIC_BASE_URL to " + u + ", which wins over magpie's"
+			managed := claudeManaged()
+			if at.sys != nil {
+				managed = at.sys("/etc/claude-code/managed-settings.json")
+			}
+			if u, _ := edit.GetJSON(managed, "env.ANTHROPIC_BASE_URL"); u != "" && u != at.gw() {
+				return "Claude Code's managed settings (" + at.native(managed) + ") set ANTHROPIC_BASE_URL to " + u + ", which wins over magpie's"
 			}
 			return wiringOff("Claude Code", path, func(k string) (string, bool) { return edit.GetJSON(path, "env."+k) },
-				"ANTHROPIC_BASE_URL", gateway.URL(), "ANTHROPIC_AUTH_TOKEN", gateway.Token)
+				"ANTHROPIC_BASE_URL", at.gw(), "ANTHROPIC_AUTH_TOKEN", gateway.Token)
 		},
 		// every prompt typed into Claude Code goes into history.jsonl
 		LastUsed: func() time.Time {
 			return lastJSONLTime(filepath.Join(filepath.Dir(path), "history.jsonl"), "timestamp", "display")
 		},
+		// a session takes a new CLAUDE_CODE_EFFORT_LEVEL on its next
+		// request, but settings.json's effort and ultracode, and the env's
+		// level taken away, only when started again. Windows can't be asked
+		// what runs.
+		Notice: func() string {
+			if stale == "" || !claudeRunning() {
+				return ""
+			}
+			return "an open Claude Code session keeps the " + stale + " it started with — restart it to use this."
+		},
 	}
+}
+
+// claudeRunning says whether a Claude Code may be open; a var so tests can
+// fake it.
+var claudeRunning = func() bool { return runtime.GOOS == "windows" || Running(`(^|/)claude( |$)`) }
+
+// claudeTakes says why Claude Code can't run model at effort v.
+func claudeTakes(model, v string) error {
+	levels := claudeEffortsFor(model)
+	if v == "" || contains(levels, v) {
+		return nil
+	}
+	if len(levels) == 0 {
+		return fmt.Errorf("Claude Code sends %s no effort", model)
+	}
+	return fmt.Errorf("Claude Code runs %s at %s, not %s (it would send %s)", model, strings.Join(levels, ", "), v, claudeClamp(v, levels))
+}
+
+// claudeModelWord refuses a value given for Claude Code's model that is a
+// bare word and not one of its aliases: `magpie claude ultra` wrote
+// "model": "ultra" over the model.
+func claudeModelWord(v, model string) error {
+	w := strings.TrimSuffix(v, "[1m]")
+	if contains(claudeAliases, w) || strings.ContainsAny(w, "-./:_0123456789") {
+		return nil
+	}
+	switch {
+	case w == "ultra" || w == "ultracode":
+		return fmt.Errorf("ultracode is a switch of Claude Code's, not a model: magpie claude ultracode on")
+	case contains(claudeEfforts, w):
+		if err := claudeTakes(model, w); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("%q is no model of Claude Code's: give a model id (claude-…), one of its aliases (%s) or a model magpie serves", v, strings.Join(claudeAliases, ", "))
+}
+
+// claudeDropModelEffort takes the effort saved for model n out of
+// modelSettings, and its entry, and modelSettings, if nothing else is left.
+func claudeDropModelEffort(path, n string) error {
+	if err := edit.DelJSON(path, "modelSettings."+n+".effortLevel"); err != nil {
+		return err
+	}
+	empty := func(k string) bool {
+		v, ok := edit.GetJSON(path, k)
+		return ok && strings.Join(strings.Fields(v), "") == "{}"
+	}
+	if empty("modelSettings." + n) {
+		if err := edit.DelJSON(path, "modelSettings."+n); err != nil {
+			return err
+		}
+	}
+	if empty("modelSettings") {
+		return edit.DelJSON(path, "modelSettings")
+	}
+	return nil
+}
+
+// claudeOwn is Anthropic's models as Claude Code takes them: only the
+// catalog's; Claude Code's own short aliases are not something any API
+// lists, and a compiled-in copy would just go stale.
+func claudeOwn() []Option {
+	var own []Option
+	for _, m := range catalog.Provider("anthropic") {
+		if strings.HasPrefix(m.ID, "claude") {
+			own = append(own, Option{Value: m.ID, Note: m.Name, Icon: "claude-color"})
+		}
+	}
+	return own
 }
 
 // claudeViaMagpie is what magpie serves Claude Code, a model with a window
@@ -265,6 +569,53 @@ func claudeViaMagpie() []Option {
 	return opts
 }
 
+// claude1M marks [1m] a magpie model whose window is 1M or more, as
+// magpie's list or models.dev gives it. Claude Code (2.1.284 and before)
+// takes any Claude model not so marked for 200K, CLAUDE_CODE_MAX_CONTEXT_TOKENS
+// or not, and compacts it, over and over, long before it runs out; a ref
+// written in bare (typed, or picked while the window wasn't known) was left
+// that way.
+func claude1M() func(ref string) string {
+	const mark = "[1m]"
+	window := map[string]int{}
+	for _, m := range magpieModels("claude") {
+		window[m.ID] = m.Context
+	}
+	return func(ref string) string {
+		if ref == "" || strings.HasSuffix(ref, mark) {
+			return ref
+		}
+		if cmp.Or(window[ref], catalog.ContextOf(ref)) >= 1_000_000 {
+			return ref + mark
+		}
+		return ref
+	}
+}
+
+// claudeWindow is the context window to tell Claude Code for the models it
+// runs on, 0 when magpie doesn't know it. One value serves every model not
+// marked [1m]: the main model's, or when that one is marked, the smallest of
+// the tiers' that aren't, so none of them outgrows its own.
+func claudeWindow(main string, tiers map[string]string) int {
+	const mark = "[1m]"
+	window := map[string]int{}
+	for _, m := range magpieModels("claude") {
+		window[m.ID] = m.Context
+	}
+	if !strings.HasSuffix(main, mark) {
+		return window[main]
+	}
+	w := 0
+	for _, t := range claudeTiers {
+		if v := tiers[t]; !strings.HasSuffix(v, mark) {
+			if c := window[v]; c > 0 && (w == 0 || c < w) {
+				w = c
+			}
+		}
+	}
+	return w
+}
+
 // claudeManaged is where an administrator's Claude Code settings live; a var
 // so tests can point it elsewhere.
 var claudeManaged = func() string {
@@ -277,9 +628,40 @@ var claudeManaged = func() string {
 	return "/etc/claude-code/managed-settings.json"
 }
 
-func claudeStandIn(path, model string) string {
+// StandIn is the model Claude Code is set to use in place of one it named
+// that magpie doesn't serve: claude-haiku-4-5-… for a title or a small
+// task goes to its haiku tier's model, and a name of no tier to its main
+// model. For Codex, the model it is set to (codexStandIn); for Desktop,
+// its independently configured tier. "" when the agent isn't routed
+// through magpie or isn't one of these. For gateway.StandIn.
+func StandIn(agent, model string) string {
+	if agent != "claude" && agent != "codex" && agent != "claude-desktop" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	if agent == "claude-desktop" {
+		return desktopStandIn(home, model)
+	}
+	if agent == "codex" {
+		return codexStandIn(filepath.Join(home, ".codex", "config.toml"))
+	}
+	if m := claudeStandIn(filepath.Join(home, ".claude", "settings.json"), model); m != "" || runtime.GOOS != "windows" {
+		return m
+	}
+	// a Claude Code in WSL is known by the same User-Agent
+	return wslClaudeStandIn(model)
+}
+
+func claudeStandIn(path, model string) string { return claudeStandInAt(path, model, gateway.URL()) }
+
+// claudeStandInAt is claudeStandIn for a Claude Code that reaches the
+// gateway at gw.
+func claudeStandInAt(path, model, gw string) string {
 	env := func(k string) string { v, _ := edit.GetJSON(path, "env."+k); return v }
-	if env("ANTHROPIC_BASE_URL") != gateway.URL() {
+	if env("ANTHROPIC_BASE_URL") != gw {
 		return ""
 	}
 	m := strings.ToLower(model)

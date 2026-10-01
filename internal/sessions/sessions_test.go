@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // copyTree copies the fixtures somewhere the test may change them.
@@ -47,15 +48,15 @@ func setup(t *testing.T) (claude, codex string) {
 	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(dir, "pi"))
 	t.Setenv("OPENCODE_DB", "")
 	t.Setenv("PI_CODING_AGENT_SESSION_DIR", "")
-	// ZCode, dsh, Cline, Qoder, Grok Build and WorkBuddy keep theirs in the
-	// home folder: never the real one's
+	// ZCode, dsh, Cline, Qoder, Grok Build, WorkBuddy and omp keep theirs in
+	// the home folder: never the real one's
 	t.Setenv("HOME", filepath.Join(dir, "home"))
 	t.Setenv("USERPROFILE", filepath.Join(dir, "home"))
 	for _, env := range []string{"DSH_HOME", "CLINE_DIR", "CLINE_DATA_DIR", "CLINE_SESSION_DATA_DIR", "QODER_CONFIG_DIR", "QODERCN_CONFIG_DIR",
 		"GROK_HOME", "WORKBUDDY_CONFIG_DIR"} {
 		t.Setenv(env, "")
 	}
-	PriceOf = func(m string) (catalog.Price, bool) {
+	PriceOf = func(_ settings.Settings, m string) (catalog.Price, bool) {
 		switch m {
 		case "claude-opus-5-5":
 			return catalog.Price{Input: 4, Output: 20, CacheRead: 0.2, CacheWrite: 5}, true
@@ -172,6 +173,7 @@ func TestIncremental(t *testing.T) {
 
 	// kept on disk: a new process reads the parse back, not the file (here
 	// changed in place, same size and time, so a re-read would show it)
+	saved()
 	b, err := os.ReadFile(CachePath())
 	if err != nil {
 		t.Fatal(err)

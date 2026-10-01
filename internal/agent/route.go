@@ -1,8 +1,6 @@
 package agent
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -74,8 +72,9 @@ func firstOf(xs []string) string {
 func magpieModels(agent string) []catalog.Model {
 	var out []catalog.Model
 	shown, _ := provider.CatalogFor(agent)
-	for _, e := range shown {
-		m := catalog.Model{ID: e.ID, Name: e.Label(), Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images, Context: e.Context, Output: e.Output}
+	labels := provider.Labels(shown)
+	for i, e := range shown {
+		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output}
 		// APIs is the one to ask it on for the gateway to relay the request
 		// as it is; none for a group, whose members may each want another
 		if e.Group == "" {
@@ -88,32 +87,23 @@ func magpieModels(agent string) []catalog.Model {
 	return out
 }
 
+// maxTokens is the output limit an agent is handed for m, kept within the
+// context window it is handed with it: models.dev lists some models' output
+// above their window (deepseek-chat's 384000 against 128000). An unknown
+// window leaves the output as it is.
+func maxTokens(m catalog.Model) int {
+	if m.Context > 0 && m.Output > m.Context {
+		return m.Context
+	}
+	return m.Output
+}
+
 // group tags every option with a group name.
 func group(name string, opts []Option) []Option {
 	for i := range opts {
 		opts[i].Group = name
 	}
 	return opts
-}
-
-// StandIn is the model Claude Code is set to use in place of one it named
-// that magpie doesn't serve: claude-haiku-4-5-… for a title or a small
-// task goes to its haiku tier's model, and a name of no tier to its main
-// model. Claude Desktop uses its configured tier model for session and
-// auxiliary requests. "" when the agent isn't routed through magpie or
-// no replacement is configured. For gateway.StandIn.
-func StandIn(agent, model string) string {
-	if agent != "claude" && agent != "claude-desktop" {
-		return ""
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	if agent == "claude-desktop" {
-		return desktopStandIn(home, model)
-	}
-	return claudeStandIn(filepath.Join(home, ".claude", "settings.json"), model)
 }
 
 func gatewayV1() string { return gateway.URL() + "/v1" }

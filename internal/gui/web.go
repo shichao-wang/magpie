@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/update"
 )
 
@@ -26,13 +27,15 @@ import (
 // webHost is the Windows a browser tab stands for.
 type webHost struct{ quit func() }
 
-func (webHost) HidePanel()                   {}
-func (webHost) ShowMain(string)              {}
-func (h webHost) Quit()                      { h.quit() }
-func (webHost) OpenURL(string)               {} // the page opens links itself
-func (webHost) Copy(string) bool             { return false }
-func (webHost) FitPanel(int, Glide)          {}
-func (webHost) TintPanel([4]uint8, int) bool { return false }
+func (webHost) HidePanel()                       {}
+func (webHost) ShowMain(string)                  {}
+func (h webHost) Quit()                          { h.quit() }
+func (webHost) OpenURL(string)                   {} // the page opens links itself
+func (webHost) Copy(string) bool                 { return false }
+func (webHost) FitPanel(int, Glide)              {}
+func (webHost) TintPanel([4]uint8, int) bool     { return false }
+func (webHost) TintTitleBar([4]uint8, bool) bool { return false }
+func (webHost) SetTextSize(int)                  {} // the browser zooms its own tab
 func (webHost) OpenFolder(path string) error {
 	return errors.New("in the browser magpie can't open folders: it is " + tilde(path))
 }
@@ -172,8 +175,12 @@ func webGuard(cookie, key string, keep time.Duration, next http.Handler) http.Ha
 }
 
 // LANAddrs are this computer's addresses on the local network, for the
-// links to print when the page is served there.
+// links to print when the page is served there: MAGPIE_PUBLIC_URL's host
+// when set (in a container, whose own addresses the network can't reach).
 func LANAddrs() []string {
+	if h := gateway.PublicHost(); h != "" {
+		return []string{h}
+	}
 	var out []string
 	as, _ := net.InterfaceAddrs()
 	for _, a := range as {

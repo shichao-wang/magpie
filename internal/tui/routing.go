@@ -34,7 +34,7 @@ func (m *model) reloadGroups() {
 	m.grow = clamp(m.grow, len(m.groups))
 }
 
-var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed}
+var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Manual}
 
 func routingName(v string) string {
 	switch v {
@@ -44,8 +44,18 @@ func routingName(v string) string {
 		return "rotate"
 	case provider.LeastUsed:
 		return "least used"
+	case provider.Manual:
+		return "manual"
 	}
 	return "smart"
+}
+
+// groupRouting is how a group routes: a manual one names its pick.
+func groupRouting(g provider.Group) string {
+	if g.Routing == provider.Manual {
+		return "manual → " + g.Picked()
+	}
+	return routingName(g.Routing)
 }
 
 func staysName(v string) string {
@@ -253,7 +263,8 @@ func (m *model) openClassifier(g provider.Group) {
 
 // ruleHint is what a rule is typed as.
 const ruleHint = `use=<model>, and any of: tokens=200k · images · effort=on|low|medium|high|xhigh|max · agents=codex,claude
-intent="a quick question" (the group's classifier=<model> tells it) · at=<n> for its place`
+intent="a quick question" (the group's classifier=<model> tells it) · compact
+time=09:00-18:00 (local; 22:00-08:00 runs past midnight) · days=mon-fri · at=<n> for its place`
 
 // openRule asks for a rule: a new one, or rule i (from 0) typed again.
 func (m *model) openRule(g provider.Group, i int) {
@@ -370,6 +381,29 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.openClassifier(g)
+	case "E", "F":
+		// the model's own effort and fast mode, whatever the agent asks
+		if onRule || n == 0 || strings.HasPrefix(g.Members[m.gsel], provider.GroupPrefix) {
+			return m, nil
+		}
+		id := g.Members[m.gsel]
+		if key == "F" {
+			fast := !g.IsFast(id)
+			said := " not fast"
+			if fast {
+				said = " fast"
+			}
+			return m, saveGroup(g.ID, func(g *provider.Group) error {
+				g.SetMemberFast(id, fast)
+				return nil
+			}, id+said)
+		}
+		model, effort := provider.MemberEffort(id)
+		to := provider.WithMemberEffort(model, nextMemberEffort(effort))
+		return m, saveGroup(g.ID, func(g *provider.Group) error {
+			g.RenameMember(id, to)
+			return nil
+		}, to+" set")
 	case "o":
 		return m, saveGroup(g.ID, nextRouting, g.Name+" routing changed")
 	case "s":
@@ -400,6 +434,19 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					g.Context = n
 					return err
 				}, g.Name+" context "+dash(v))
+			}})
+		m.back = modeGroup
+	case "l":
+		in := newInput("e.g. low,medium,high,xhigh · empty for those its models share")
+		in.SetValue(strings.Join(g.Levels, ","))
+		m.openAsk(ask{crumbs: []string{"routing", g.Name, "levels"}, input: in, empty: true,
+			hint: "the reasoning levels agents are offered: " + strings.Join(provider.Levels, ", ") + "; a model without the one asked is sent its nearest",
+			onEnter: func(v string) tea.Cmd {
+				return saveGroup(g.ID, func(g *provider.Group) error {
+					var err error
+					g.Levels, err = provider.CleanLevels(strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' }))
+					return err
+				}, g.Name+" levels "+dash(v))
 			}})
 		m.back = modeGroup
 	case "R":
@@ -459,6 +506,13 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// nextMemberEffort is the effort E sets a member at after effort: the
+// agent's (""), then low to max, then the agent's again.
+func nextMemberEffort(effort string) string {
+	cycle := []string{"", "low", "medium", "high", "xhigh", "max"}
+	return cycle[(slices.Index(cycle, effort)+1)%len(cycle)]
+}
+
 // renamedMsg is a group given another id: the page follows it.
 type renamedMsg struct{ from, to string }
 
@@ -496,7 +550,7 @@ func (m model) viewGroups() string {
 			b.WriteString(line + "\n")
 			continue
 		}
-		notes := []string{fmt.Sprintf("%d model%s", len(g.Members), plural(len(g.Members))), routingName(g.Routing)}
+		notes := []string{fmt.Sprintf("%d model%s", len(g.Members), plural(len(g.Members))), groupRouting(g)}
 		if g.Affinity != "" {
 			notes = append(notes, staysName(g.Affinity))
 		}
@@ -524,9 +578,12 @@ func (m model) viewGroup() string {
 	var b strings.Builder
 	b.WriteString(m.header("routing", g.Name))
 	b.WriteString("\n\n")
-	head := []string{provider.GroupPrefix + g.ID, routingName(g.Routing), staysName(g.Affinity)}
+	head := []string{provider.GroupPrefix + g.ID, groupRouting(g), staysName(g.Affinity)}
 	if g.Context > 0 {
 		head = append(head, "context "+fmtTokens(g.Context))
+	}
+	if len(g.Levels) > 0 {
+		head = append(head, "levels "+strings.Join(g.Levels, "/"))
 	}
 	if g.Family != "" {
 		head = append(head, "family "+g.Family)
@@ -540,6 +597,9 @@ func (m model) viewGroup() string {
 		marker, name := "  ", sText.Render(id)
 		if i == m.gsel {
 			marker, name = sCursor.Render("▸ "), sNameOn.Render(id)
+		}
+		if g.IsFast(id) {
+			name += sMuted.Render(" · fast")
 		}
 		b.WriteString(pad + marker + sFaint.Render(fmt.Sprintf("%d  ", i+1)) + name + "\n")
 	}
