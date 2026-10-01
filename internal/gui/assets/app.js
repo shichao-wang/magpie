@@ -841,7 +841,8 @@ const FOLLOWS_MODEL = [...TIERS, "subagents"];
 
 // A field that follows the model unless set — Codex's subagents, Claude
 // Code's tiers, Desktop's session tiers — is a small square after the
-// pickers rather than a third picker, which a row has no room for.
+// pickers rather than a third picker, which a row has no room for: it wrapped
+// onto a line of its own.
 // So is Codex's sign-in, ChatGPT or magpie as its provider.
 const extra = (f) => f.key === "tiers" || FOLLOWS_MODEL.includes(f.label) || f.label === "sign-in";
 const EXTRA_GLYPH = {

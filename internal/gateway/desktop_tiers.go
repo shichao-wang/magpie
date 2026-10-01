@@ -16,6 +16,8 @@ var DesktopTiers func() map[string]string
 // display names replaced by Desktop's model catalog, even with display_name set.
 // Mythos aliases keep its effort picker without matching a catalog model; the
 // explicit anthropic_family_tier identifies the tier independently of the alias.
+// Desktop shows the name, not the id, and folds rows of one name into one entry;
+// tier suffixes keep the four choices distinct when they route to the same model.
 func desktopModels() []map[string]any {
 	tiers := []struct{ id, name, tier string }{
 		{"mythos-magpie-opus", "Claude Opus", "opus"},

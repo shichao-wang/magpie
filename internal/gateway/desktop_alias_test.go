@@ -1,9 +1,17 @@
 package gateway
 
 import (
-	"github.com/yetone/magpie/internal/provider"
 	"regexp"
 	"strings"
+
+	"github.com/yetone/magpie/internal/provider"
+)
+
+// desktopClaude is a model id that is Anthropic's own Claude model, as tIt
+// knows it: claude-<tier>-<version>, a date taken off.
+var (
+	desktopClaude = regexp.MustCompile(`^claude-(?:opus|sonnet|haiku|fable|mythos)-\d+(?:-\d+)?$`)
+	desktopDated  = regexp.MustCompile(`-\d{8}$`)
 )
 
 // Legacy generators are test fixtures for aliases already issued to Desktop.
@@ -16,8 +24,8 @@ func claudeModel(e provider.Entry) string {
 	if i := strings.LastIndex(m, "/"); i >= 0 {
 		m = m[i+1:]
 	}
-	m = regexp.MustCompile(`-\d{8}$`).ReplaceAllString(m, "")
-	if regexp.MustCompile(`^claude-(?:opus|sonnet|haiku|fable|mythos)-\d+(?:-\d+)?$`).MatchString(m) {
+	m = desktopDated.ReplaceAllString(m, "")
+	if desktopClaude.MatchString(m) {
 		return m
 	}
 	return ""
