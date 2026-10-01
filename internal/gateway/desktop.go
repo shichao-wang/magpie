@@ -50,9 +50,44 @@ func desktopAccepts(id string) bool {
 	return false
 }
 
-// Aliases issued by earlier Desktop catalogs still resolve.
+// These aliases were issued by earlier Desktop catalogs and still resolve for
+// existing sessions. New catalogs use the four tier ids in desktop_tiers.go.
+//
+// desktopAlias is the prefix of the id a model is listed by to Claude
+// Desktop when its own id names no Claude model: anthropic/magpie-<number>,
+// the number a hash of magpie's id, so it stays the model's while the
+// catalog changes around it. Desktop's list of other vendors' names grows
+// from release to release, so no part of such a model's id is shown to it;
+// its display_name and description carry the model's name and magpie id.
+const desktopAlias = "anthropic/magpie-"
+
+// Claude Desktop offers a thinking-effort picker only for a model it knows:
+// in a gateway's mode it reads no effort from /v1/models (IIt keeps id,
+// display_name, description, supports_1m and anthropic_family_tier), and
+// its signed model catalog can't be a gateway's, so its levels come from
+// tIt in its app.asar (index.chunk-D3OyLXgG.js, 2.7032):
+//
+//	let t=IC(e), n=HFt[t] ?? (UFt.test(t) ? VFt : void 0)
+//
+// HFt its table of Claude models (claude-sonnet-4-6, claude-opus-4-8, …),
+// UFt /^(?:claude-)?(?:fable|mythos)(?:-|$)/ with VFt low, medium, high,
+// xhigh and max (high recommended, thinking always on), and IC the id
+// lowercased with a Bedrock-style "<profile>.anthropic." prefix and a date
+// taken off. No provider/model id is either, so no model magpie served had
+// the picker (ARNO). Earlier catalogs listed a model with reasoning levels
+// by one of these instead:
+//
+//   - a Claude model (claude-opus-4-8 at any provider):
+//     magpie-<number>.anthropic.claude-opus-4-8, which IC reads as
+//     claude-opus-4-8 and Claude Code as Claude Opus 4.8, as before;
+//   - any other: mythos-magpie-<number>, which UFt matches. Nothing in it
+//     says haiku, sonnet or opus, so Desktop's small_fast pick is as it
+//     was, and Claude Code (which knows claude-mythos-… only) takes it for
+//     a model it doesn't know and sends its effort as output_config.effort.
+//
+// The effort chosen reaches the gateway as thinking plus
+// output_config.effort and is fitted to the model's own levels there.
 const (
-	desktopAlias       = "anthropic/magpie-"
 	desktopEffortAlias = "mythos-magpie-"
 	desktopClaudeInfix = ".anthropic."
 )
@@ -61,101 +96,6 @@ func aliasNumber(id string) string {
 	h := fnv.New64a()
 	h.Write([]byte(id))
 	return fmt.Sprintf("%010d", h.Sum64()%1e10)
-}
-
-// DesktopTiers supplies one configuration snapshot per discovery request. Set by main.
-var DesktopTiers func() map[string]string
-
-// desktopModels lists four stable routing aliases. Standard Claude ids have their
-// display names replaced by Desktop's model catalog, even with display_name set.
-// Mythos aliases keep its effort picker without matching a catalog model; the
-// explicit anthropic_family_tier identifies the tier independently of the alias.
-func desktopModels() []map[string]any {
-	tiers := []struct{ id, name, tier string }{
-		{"mythos-magpie-opus", "Claude Opus", "opus"},
-		{"mythos-magpie-sonnet", "Claude Sonnet", "sonnet"},
-		{"claude-haiku-magpie", "Claude Haiku", "haiku"},
-		{"mythos-magpie-fable", "Claude Fable", "fable"},
-	}
-	data := make([]map[string]any, 0, len(tiers))
-	served := provider.Served()
-	var shown []provider.Entry
-	names, narrowed := provider.VisibleTo("claude-desktop")
-	for _, e := range served {
-		if (e.Group != "" || !e.Provider.Unlisted) && (!narrowed || provider.Shows(names, e)) {
-			shown = append(shown, e)
-		}
-	}
-	configured := map[string]string{}
-	if DesktopTiers != nil {
-		configured = DesktopTiers()
-	} else {
-		for _, tier := range tiers {
-			configured[tier.tier] = desktopStandIn(tier.tier)
-		}
-	}
-	for _, tier := range tiers {
-		e := provider.Entry{ID: tier.id, Model: tier.id, Name: tier.name}
-		routed := configured[tier.tier]
-		if routed == "" && len(shown) > 0 {
-			routed = shown[0].ID
-		}
-		if routed != "" {
-			name := routed
-			for _, model := range served {
-				if model.ID == routed {
-					name = desktopName(model)
-					e.Context, e.Output = model.Context, model.Output
-					break
-				}
-			}
-			e.Name = name + " · " + strings.TrimPrefix(tier.name, "Claude ")
-		}
-		if tier.tier != "haiku" {
-			e.Efforts = []string{"low", "medium", "high", "xhigh", "max"}
-		}
-		m := modelObject(e)
-		m["owned_by"], m["anthropic_family_tier"] = "anthropic", tier.tier
-		if routed != "" {
-			m["description"] = routed + " in magpie"
-		}
-		data = append(data, m)
-	}
-	return data
-}
-
-var desktopTierName = regexp.MustCompile(`^(?:claude-(?:\d+(?:[-.]\d+)*-)?)?(opus|sonnet|haiku|fable)(?:[-.]\d+)*$`)
-
-// DesktopTier identifies routing aliases and historical Claude tiers for agents and the gateway.
-func DesktopTier(id string) string {
-	id = strings.TrimSuffix(strings.ToLower(id), "[1m]")
-	id = strings.TrimPrefix(id, "anthropic/")
-	switch id {
-	case "mythos-magpie-opus":
-		return "opus"
-	case "mythos-magpie-sonnet":
-		return "sonnet"
-	case "claude-haiku-magpie":
-		return "haiku"
-	case "mythos-magpie-fable":
-		return "fable"
-	}
-	if tier := desktopTierName.FindStringSubmatch(id); tier != nil {
-		return tier[1]
-	}
-	return ""
-}
-
-func desktopTierOf(id string) string { return DesktopTier(id) }
-
-// Fixed tier ids always route; full turns on other served legacy models keep their model.
-func desktopFixedTier(id string) bool {
-	id = strings.TrimSuffix(strings.ToLower(id), "[1m]")
-	switch id {
-	case "opus", "sonnet", "haiku", "fable", "mythos-magpie-opus", "mythos-magpie-sonnet", "claude-haiku-magpie", "mythos-magpie-fable", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5", "claude-fable-5":
-		return true
-	}
-	return false
 }
 
 func desktopName(e provider.Entry) string {
@@ -200,8 +140,23 @@ func isClaudeDesktop(r *http.Request) bool {
 	return strings.HasPrefix(ua, "Mozilla/") && strings.Contains(ua, " Claude/")
 }
 
-// Desktop's four tier ids always use their own configuration. The last full
-// turn is kept only as a fallback for older sessions' auxiliary model ids.
+// Claude Desktop sends some requests on a model of its own choosing rather
+// than the one its session is on. A session's title (and branch name) is
+// asked for by one tool-less request whose model is its "small_fast" pick
+// from the gateway's list — the first id with haiku in it, else sonnet,
+// else opus (_$n in its app.asar, 2.7032), the session's model only when
+// none has one — so {"model":"claude-sonnet-5-thinking","max_tokens":200,
+// "system":"You write short session titles. …"} went to a Claude model the
+// user never picked. Claude Code in its Code tab asks for its own
+// claude-haiku-… by name for small tasks too.
+//
+// Desktop's four tier ids and historical tier requests use their own
+// configuration, or the first visible catalog model when unconfigured.
+// For older sessions using other ids, turns carrying tools remember the
+// selected model as a fallback for unserved or small tool-less requests.
+// It is kept on disk so these auxiliary requests can still resolve before
+// the first full turn after a restart; before any selection, they use
+// desktopDefault.
 var desktopPicked struct {
 	sync.Mutex
 	model string
@@ -215,7 +170,7 @@ func desktopStandIn(model string) string {
 		return ""
 	}
 	model = strings.ToLower(strings.TrimSuffix(model, "[1m]"))
-	if tier := desktopTierOf(model); tier != "" {
+	if tier := DesktopTier(model); tier != "" {
 		model = tier
 	}
 	if m := StandIn("claude-desktop", model); m != "" && m != model {
@@ -244,7 +199,7 @@ func desktopSelection(remember string) string {
 }
 
 func desktopSessionModel(picked string) string {
-	if desktopTierOf(picked) != "" && (desktopFixedTier(picked) || unserved(picked)) {
+	if DesktopTier(picked) != "" && (desktopFixedTier(picked) || unserved(picked)) {
 		return desktopDefault(picked)
 	}
 	return picked
@@ -261,7 +216,7 @@ func desktopResolve(asked string, body []byte, remember bool) string {
 		return asked
 	}
 	tools := hasTools(body)
-	tier := desktopTierOf(asked)
+	tier := DesktopTier(asked)
 	if tier != "" && (desktopFixedTier(asked) || unserved(asked) || !tools && small(body)) {
 		if remember && tools {
 			desktopSelection(asked)
@@ -295,6 +250,13 @@ func desktopResolve(asked string, body []byte, remember bool) string {
 	return asked
 }
 
+// desktopDefault uses the configured replacement for asked, else the first
+// model shown to Desktop. A new session's first message is titled before it
+// is sent (ARNO), so nothing may be picked yet when the title is asked for.
+// Desktop starts new sessions on the first unrestricted /v1/models row
+// (resolveDefaultSessionModel in its app.asar); unconfigured tiers use the
+// first visible model from magpie's catalog. "" when that is asked itself
+// or magpie shows Desktop no model.
 func desktopDefault(asked string) string {
 	if m := desktopStandIn(asked); m != "" {
 		return m

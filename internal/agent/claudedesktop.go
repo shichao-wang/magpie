@@ -115,59 +115,7 @@ func claudeDesktop(home string) *Agent {
 			also = filepath.Join(d, "Claude")
 		}
 	}
-	fields := []Field{{
-		Key: "provider", Label: "provider",
-		Get: func() string {
-			if desktopWired(p) {
-				return magpieID
-			}
-			return ""
-		},
-		Set: func(v string) error {
-			if v == "" {
-				return desktopOff(p)
-			}
-			return desktopOn(p)
-		},
-		Options: func(map[string]string) []Option {
-			return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
-				Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
-		},
-	}}
-	for _, tier := range claudeTiers {
-		fields = append(fields, Field{
-			Key: tier, Label: tier, Quiet: true,
-			Get: func() string {
-				if !desktopWired(p) {
-					return ""
-				}
-				v, _ := edit.GetJSON(desktopTiersPath(), tier)
-				return v
-			},
-			Set: func(v string) error {
-				if !desktopWired(p) {
-					if v == "" {
-						return nil
-					}
-					return fmt.Errorf("connect Claude Desktop to magpie first; %s can then have its own model", tier)
-				}
-				if v != "" && !isMagpie(v) {
-					return fmt.Errorf("%s: %q is not a model magpie serves", tier, v)
-				}
-				if v == "" {
-					return edit.DelJSON(desktopTiersPath(), tier)
-				}
-				return edit.SetJSON(desktopTiersPath(), edit.KV{Path: tier, Value: v})
-			},
-			Options: func(map[string]string) []Option {
-				if !desktopWired(p) {
-					return nil
-				}
-				return viaMagpie("claude-desktop", "")
-			},
-		})
-	}
-	return &Agent{
+	a := &Agent{
 		ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Aliases: []string{"claude-app"},
 		Dir: p.dir, Path: p.config,
 		detect: func() bool {
@@ -200,8 +148,57 @@ func claudeDesktop(home string) *Agent {
 			return wiringOff("Claude Desktop", p.prof, func(k string) (string, bool) { return edit.GetJSON(p.prof, k) },
 				"inferenceGatewayBaseUrl", gateway.URL(), "inferenceGatewayApiKey", gateway.TokenFor("claude-desktop"))
 		},
-		Fields: fields,
+		Fields: []Field{{
+			Key: "provider", Label: "provider",
+			Get: func() string {
+				if desktopWired(p) {
+					return magpieID
+				}
+				return ""
+			},
+			Set: func(v string) error {
+				if v == "" {
+					return desktopOff(p)
+				}
+				return desktopOn(p)
+			},
+			Options: func(map[string]string) []Option {
+				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
+					Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
+			},
+		}},
 	}
+	for _, tier := range claudeTiers {
+		a.Fields = append(a.Fields, Field{
+			Key: tier, Label: tier, Quiet: true,
+			Get: func() string {
+				if !desktopWired(p) {
+					return ""
+				}
+				v, _ := edit.GetJSON(desktopTiersPath(), tier)
+				return v
+			},
+			Set: func(v string) error {
+				if !desktopWired(p) {
+					if v == "" {
+						return nil
+					}
+					return fmt.Errorf("connect Claude Desktop to magpie first; %s can then have its own model", tier)
+				}
+				if v != "" && !isMagpie(v) {
+					return fmt.Errorf("%s: %q is not a model magpie serves", tier, v)
+				}
+				return jsonSet(desktopTiersPath(), tier)(v)
+			},
+			Options: func(vals map[string]string) []Option {
+				if vals["provider"] != magpieID {
+					return nil
+				}
+				return viaMagpie("claude-desktop", "")
+			},
+		})
+	}
+	return a
 }
 
 func desktopStandIn(home, model string) string {

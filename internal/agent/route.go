@@ -96,7 +96,12 @@ func group(name string, opts []Option) []Option {
 	return opts
 }
 
-// StandIn resolves an agent's configured replacement; an empty value leaves fallback to the gateway.
+// StandIn is the model Claude Code is set to use in place of one it named
+// that magpie doesn't serve: claude-haiku-4-5-… for a title or a small
+// task goes to its haiku tier's model, and a name of no tier to its main
+// model. Claude Desktop uses its configured tier model for session and
+// auxiliary requests. "" when the agent isn't routed through magpie or
+// no replacement is configured. For gateway.StandIn.
 func StandIn(agent, model string) string {
 	if agent != "claude" && agent != "claude-desktop" {
 		return ""

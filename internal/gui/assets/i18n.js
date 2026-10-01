@@ -65,7 +65,6 @@ const I18N = {
     "magpie is Codex's provider; the Codex app is in its API state, with magpie's models only": "magpie 作为 Codex 的供应商，Codex 应用显示为 API 登录状态，只列出 magpie 的模型",
     "same as model": "同主模型",
     "same as model ({model})": "同主模型（{model}）",
-    "first available catalog model": "当前可用目录中的首个模型",
     "unconfigured tier uses first catalog model": "未配置档位时使用目录首项",
     "Same as model": "同主模型",
     "{agent} stays signed in; magpie just stops offering it": "{agent} 仍保持登录，只是 magpie 不再提供它",

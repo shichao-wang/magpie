@@ -111,7 +111,7 @@ func TestClaudeDesktopTiers(t *testing.T) {
 	before := StandIn
 	StandIn = func(agent, model string) string {
 		if agent == "claude-desktop" {
-			return chosen[desktopTierOf(model)]
+			return chosen[DesktopTier(model)]
 		}
 		return ""
 	}
@@ -134,7 +134,7 @@ func TestClaudeDesktopTiers(t *testing.T) {
 	}
 	for _, model := range desktopModels() {
 		id := model["id"].(string)
-		tier := desktopTierOf(id)
+		tier := DesktopTier(id)
 		for _, asked := range []string{id, tier, "anthropic/" + id, id + "[1m]", map[string]string{"opus": "claude-opus-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5", "fable": "claude-fable-5"}[tier]} {
 			for _, tools := range []bool{true, false} {
 				if got := send("claude-desktop", asked, tools); got != strings.TrimPrefix(chosen[tier], "fake/") {

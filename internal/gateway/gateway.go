@@ -403,9 +403,9 @@ func (s *Server) models(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) model(w http.ResponseWriter, r *http.Request) {
 	id := unprefixed(r.PathValue("id"))
-	if agentOf(r) == "claude-desktop" && desktopTierOf(id) != "" {
+	if agentOf(r) == "claude-desktop" && DesktopTier(id) != "" {
 		for _, model := range desktopModels() {
-			if desktopTierOf(model["id"].(string)) == desktopTierOf(id) {
+			if DesktopTier(model["id"].(string)) == DesktopTier(id) {
 				writeJSON(w, 200, model)
 				return
 			}
@@ -1280,8 +1280,8 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	if e := fitFor(p, model, asked); asked != "" && e != asked {
 		body = withBodyEffort(proto, body, e)
 	}
-	if proto == provider.Anthropic {
-		body = withClaudeThinking(body, model)
+	if proto == provider.Anthropic && agentOf(r) == "claude-desktop" {
+		body = desktopThinking(body, model)
 	}
 	path := pathOf(proto)
 	if proto == provider.Anthropic && p.Account == nil && fromClaudeCode(r.Header) && r.URL.Query().Get("beta") == "true" {

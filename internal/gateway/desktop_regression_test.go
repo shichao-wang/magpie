@@ -9,6 +9,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func TestClaudeDesktopTierCapacitySnapshot(t *testing.T) {
@@ -58,6 +59,42 @@ func TestClaudeDesktopTierCapacitySnapshot(t *testing.T) {
 			if m["id"] == "mythos-magpie-opus" && m["max_output_tokens"] != float64(32768) {
 				t.Errorf("output capacity: %v", m)
 			}
+		}
+	}
+}
+
+func TestClaudeDesktopTierCatalogVisibility(t *testing.T) {
+	up := setup(t, provider.Anthropic, &fake{})
+	for _, p := range []provider.Provider{
+		{ID: "hidden", Name: "Hidden", Key: "k", Anthropic: up.URL, Models: []string{"m"}, Contexts: map[string]int{"m": 500000}},
+		{ID: "unlisted", Name: "Unlisted", Key: "k", Anthropic: up.URL, Models: []string{"m"}, Unlisted: true, Contexts: map[string]int{"m": 750000}},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := settings.Load()
+	s.Visible = map[string][]string{"claude-desktop": {"fake"}}
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	before := DesktopTiers
+	DesktopTiers = func() map[string]string {
+		return map[string]string{"opus": "hidden/m", "sonnet": "unlisted/m", "fable": "unlisted/private-model"}
+	}
+	t.Cleanup(func() { DesktopTiers = before })
+	models := desktopModels()
+	for i, want := range []struct {
+		name string
+		ctx  int
+	}{
+		{"m · Opus", 500000},
+		{"m · Sonnet", 750000},
+		{"m1 · Haiku", 0},
+		{"unlisted/private-model · Fable", 0},
+	} {
+		if models[i]["display_name"] != want.name || want.ctx > 0 && models[i]["max_input_tokens"] != want.ctx {
+			t.Errorf("tier %d: %v, want %+v", i, models[i], want)
 		}
 	}
 }
@@ -122,6 +159,16 @@ func TestClaudeDesktopThinkingActualModel(t *testing.T) {
 			}
 			if v.Model != model || v.Thinking.Type != wantType || v.Max != cap || len(v.OutputConfig["format"]) == 0 || v.Metadata["user_id"] != "test" || len(v.Tools) != 1 || len(v.Messages) != 1 {
 				t.Fatalf("%s cap %d: %s", model, cap, f.got)
+			}
+			// Other agents keep the existing Anthropic passthrough behavior.
+			f.refuse = nil
+			body = strings.Replace(body, "mythos-magpie-opus", "fake/"+model, 1)
+			req = httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+			req.Header.Set("x-api-key", TokenFor("claude"))
+			rec = httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, req)
+			if rec.Code != 200 || json.Unmarshal(f.got, &v) != nil || v.Thinking.Type != "adaptive" || string(v.OutputConfig["effort"]) != `"high"` {
+				t.Fatalf("other agent %s: %d %s", model, rec.Code, f.got)
 			}
 		}
 	}

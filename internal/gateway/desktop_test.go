@@ -116,7 +116,7 @@ func TestClaudeDesktopTierNames(t *testing.T) {
 	before := StandIn
 	StandIn = func(agent, model string) string {
 		if agent == "claude-desktop" {
-			return chosen[desktopTierOf(model)]
+			return chosen[DesktopTier(model)]
 		}
 		return ""
 	}

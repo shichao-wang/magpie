@@ -224,64 +224,6 @@ func adaptiveOnly(model string) bool {
 	return major > 4 || major == 4 && minor >= 6
 }
 
-// withClaudeThinking fits passthrough thinking to the actual Claude version, preserving other fields.
-func withClaudeThinking(body []byte, model string) []byte {
-	if !claudeVersion.MatchString(strings.ToLower(model)) {
-		return body
-	}
-	var v struct {
-		Thinking struct {
-			Type   string `json:"type"`
-			Budget int    `json:"budget_tokens"`
-		} `json:"thinking"`
-		OutputConfig map[string]json.RawMessage `json:"output_config"`
-		MaxTokens    int                        `json:"max_tokens"`
-	}
-	if json.Unmarshal(body, &v) != nil {
-		return body
-	}
-	if adaptiveOnly(model) {
-		if v.Thinking.Type != "enabled" {
-			return body
-		}
-		fields := map[string]any{"thinking": map[string]any{"type": "adaptive"}}
-		if len(v.OutputConfig["effort"]) == 0 {
-			if effort := effortOfBudget(v.Thinking.Budget); effort != "" {
-				if effort == "xhigh" {
-					effort = "max"
-				}
-				if v.OutputConfig == nil {
-					v.OutputConfig = map[string]json.RawMessage{}
-				}
-				v.OutputConfig["effort"], _ = json.Marshal(effort)
-				fields["output_config"] = v.OutputConfig
-			}
-		}
-		return withFields(body, fields)
-	}
-	if v.Thinking.Type != "adaptive" {
-		return body
-	}
-	budget := budgetOf(requestEffort(provider.Anthropic, body))
-	maxTokens := v.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = max(16384, budget+4096)
-	}
-	fields := map[string]any{"max_tokens": maxTokens}
-	if maxTokens <= 1024 {
-		fields["thinking"] = map[string]any{"type": "disabled"}
-	} else {
-		fields["thinking"] = map[string]any{"type": "enabled", "budget_tokens": min(budget, max(1024, maxTokens-1024))}
-	}
-	delete(v.OutputConfig, "effort")
-	if len(v.OutputConfig) > 0 {
-		fields["output_config"] = v.OutputConfig
-	} else {
-		body = withoutFields(body, "output_config")
-	}
-	return withFields(body, fields)
-}
-
 // AdaptiveThinking is adaptiveOnly for agents told how to ask a model: a
 // Claude that takes thinking.type=adaptive and an effort, never a budget.
 func AdaptiveThinking(model string) bool { return adaptiveOnly(model) }

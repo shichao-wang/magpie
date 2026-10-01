@@ -55,14 +55,14 @@ func TestClaudeDesktopTierCatalogNames(t *testing.T) {
 	}
 	for _, m := range desktopModels() {
 		id, name := m["id"].(string), m["display_name"].(string)
-		if m["anthropic_family_tier"] != desktopTierOf(id) {
+		if m["anthropic_family_tier"] != DesktopTier(id) {
 			t.Errorf("%s: wrong family tier %v", id, m["anthropic_family_tier"])
 		}
 		for _, asked := range []string{id, id + "[1m]"} {
 			if got := pickerName(asked, name); got != name {
 				t.Errorf("%s: catalog replaced %q with %q", asked, name, got)
 			}
-			if desktopPicker(asked) != (desktopTierOf(id) != "haiku") {
+			if desktopPicker(asked) != (DesktopTier(id) != "haiku") {
 				t.Errorf("%s: effort capabilities changed", asked)
 			}
 		}
@@ -145,7 +145,7 @@ func TestClaudeDesktopEffortIDs(t *testing.T) {
 		t.Fatalf("Desktop list: %s", rec.Body)
 	}
 	for _, m := range list.Data {
-		if tier := desktopTierOf(m.ID); tier == "" || desktopPicker(m.ID) != (tier != "haiku") {
+		if tier := DesktopTier(m.ID); tier == "" || desktopPicker(m.ID) != (tier != "haiku") {
 			t.Errorf("tier %s: unexpected effort picker", m.ID)
 		}
 	}
@@ -179,7 +179,7 @@ func TestClaudeDesktopEffortReachesModel(t *testing.T) {
 	}
 	before := StandIn
 	StandIn = func(agent, model string) string {
-		if agent == "claude-desktop" && desktopTierOf(model) != "" {
+		if agent == "claude-desktop" && DesktopTier(model) != "" {
 			return "fake/m1"
 		}
 		return ""

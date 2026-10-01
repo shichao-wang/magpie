@@ -891,7 +891,7 @@ function tierMenu(a) {
     key: "tiers", label: "tiers", value: "", menu: true, custom: custom.length > 0,
     summary: custom.length ? custom.map((f) => f.label).join(", ") : t(main ? "same as model" : "unconfigured tier uses first catalog model"),
     options: tiers.map((f) => ({
-      value: f.key, label: f.label, icon: optionFor(f, f.value)?.icon || (main && optionFor(main, main.value)?.icon) || a.icon,
+      value: f.key, label: f.label, icon: optionFor(f, f.value)?.icon || (main ? optionFor(main, main.value)?.icon : a.icon),
       note: f.value ? name(f) : follows,
     })),
   };
@@ -1131,8 +1131,8 @@ function openPicker(agent, field, anchor, ev, only) {
   if (FOLLOWS_MODEL.includes(field.label)) {
     const main = agent.fields.find((f) => f.key === "model");
     const opt = main && optionFor(main, main.value);
-    options.unshift({ value: "", label: t(main ? "Same as model" : "unconfigured tier uses first catalog model"),
-      note: main ? opt?.label || main.value : t("first available catalog model"), icon: opt?.icon || agent.icon, reset: true });
+    options.unshift({ value: "", label: t(main ? "Same as model" : "Default"),
+      note: main ? opt?.label || main.value : t("unconfigured tier uses first catalog model"), icon: main ? opt?.icon : agent.icon, reset: true });
   } else if (!only && !field.menu && !field.onPick && !options.some((o) => o.value === "")) options.unshift({ value: "", label: t("Default"), note: t("what {agent} ships with", { agent: agent.name }), icon: agent.icon, reset: true });
   const modelPicker = ["model", "small", "large", ...FOLLOWS_MODEL].includes(field.label) && !only;
   pick = { agent, field, options, anchor, cursor: 0, free: !only && !field.menu, modelPicker, effortPicker, groupFilter: "all" };
